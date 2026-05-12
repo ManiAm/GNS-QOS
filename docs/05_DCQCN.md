@@ -85,7 +85,7 @@ The CNP format is defined by the IBTA (InfiniBand Trade Association) RoCEv2 spec
 
 The packet carries exactly two pieces of actionable information. The **Opcode 0x81** in the Base Transport Header tells the receiving NIC's hardware parser "this is a congestion notification, not data — route it to the rate-control engine." The **Destination QP (Queue Pair) Number** identifies which specific RDMA flow caused the congestion, allowing the sender to throttle only that flow's rate limiter rather than all flows indiscriminately. The source and destination IP addresses are swapped relative to the original data packet because the CNP travels in the reverse direction — from receiver back to sender.
 
-Beyond these fields, the CNP carries nothing: no queue depth, no switch identifier, no timestamp, no utilization metric. It is a pure "you caused congestion" signal with a flow identifier attached. This intentional minimalism keeps CNPs tiny and fast to generate in hardware, but it is also the root limitation addressed by [Extended CNP](05_DCQCN_.md#lighter-signals-ecnp-and-csig) and [IFA telemetry](05_DCQCN_.md#per-hop-telemetry-int-and-ifa) in the next document.
+Beyond these fields, the CNP carries nothing: no queue depth, no switch identifier, no timestamp, no utilization metric. It is a pure "you caused congestion" signal with a flow identifier attached. This intentional minimalism keeps CNPs tiny and fast to generate in hardware, but it is also the root limitation addressed by [CSIG](06_DCQCN_.md#congestion-signaling-csig) and [IFA telemetry](06_DCQCN_.md#per-hop-telemetry-int-and-ifa) in the next document.
 
 **Protecting the Notification Signal**
 

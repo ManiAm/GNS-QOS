@@ -4,7 +4,7 @@
 The [QoS overview](01_QOS.md) established why different traffic needs different treatment. This document covers *how* the networking industry standardized that treatment and then dives into the switch-level mechanisms that DiffServ relies on to enforce its rules packet by packet.
 
 
-## The Baseline: Best-Effort IP & The ToS Field
+## The Baseline: Best-Effort IP and The ToS Field
 
 When the Internet was built, it used a Best-Effort model. Think of this like the standard postal service: the network promises to try its best to deliver your data, but there are no guarantees on speed, delivery, or timing.
 
