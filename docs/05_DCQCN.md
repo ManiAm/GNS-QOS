@@ -339,3 +339,15 @@ sudo mlxconfig -d /dev/mst/mt4115_pciconf0 q | grep -iE "rpg_|clamp|dce_tcp|rate
 DCQCN is essentially the hardware silicon equivalent of Datacenter TCP (DCTCP). Both rely on ECN to catch traffic jams before packets start dropping, and both use the same philosophical approach of "Additive Increase, Multiplicative Decrease" (AIMD). The massive difference is the execution layer: TCP congestion control happens in the host operating system's software, which is too slow for modern supercomputing and AI clusters. DCQCN is baked directly into the NIC hardware, allowing it to react in microseconds without bothering the server's CPU.
 
 In a properly designed datacenter, DCQCN (UDP) and standard TCP traffic are completely isolated from one another. Network engineers use QoS and PFC on the physical switches to assign RoCEv2/DCQCN traffic to a dedicated, lossless Priority Group (e.g., PG3), while standard TCP is mapped to a separate, lossy Priority Group (e.g., PG0). If you were to dump both types of traffic into the same Priority Group without QoS separation, they would interfere with each other. The hardware-driven DCQCN and the software-driven TCP algorithms would interpret the network's congestion signals differently and end up fighting over the same bandwidth, leading to poor performance for both.
+
+The table below summarizes the key architectural differences:
+
+|                          | DCTCP                                        | DCQCN                                          |
+|--------------------------|----------------------------------------------|------------------------------------------------|
+| **Execution layer**      | Host OS kernel (software TCP stack)          | NIC hardware (silicon state machine)           |
+| **Transport**            | TCP                                          | UDP (RoCEv2)                                   |
+| **Congestion signal**    | ECN CE marks counted over ACK stream         | ECN CE marks trigger standalone CNP            |
+| **Rate control**         | Window-based (cwnd adjustment)               | Rate-based (hardware shaper in Mbps)           |
+| **Reaction speed**       | Milliseconds (kernel scheduling)             | Microseconds (hardware pipeline)               |
+| **Feedback mechanism**   | ECN-Echo flag piggybacked on TCP ACKs        | Dedicated CNP packet (Opcode 0x81)             |
+| **Coexistence**          | Lossy priority group (e.g., PG0)             | Lossless priority group (e.g., PG3)            |

@@ -3,10 +3,11 @@
 
 The [DCQCN feedback loop](05_DCQCN.md) is effective, but it has a fundamental limitation: the signal is binary. The standard CNP tells the sender exactly one thing — "you caused congestion" — with no information about how severe the congestion is, which switch is the bottleneck, or how deep the queue has grown. The sender reacts to every CNP with the same formula, regardless of whether the switch buffer is 10% full or 90% full. This can lead to over-correction (slashing the rate when a gentle tap would suffice) or under-correction (applying the same mild cut to both minor and severe congestion).
 
-The evolution beyond standard DCQCN follows two threads:
+The evolution beyond standard DCQCN follows three threads:
 
 - Richer congestion signals that give the sender real data about network conditions
-- A programmable engine that lets the sender act on that data with custom logic
+- Faster feedback paths that cut the control loop latency by having switches signal the sender directly
+- A programmable engine that lets the sender act on any of these signals with custom logic
 
 
 ## Per-Hop Telemetry (INT and IFA)
@@ -91,7 +92,7 @@ The table below shows a representative telemetry profile commonly used for conge
 Because each switch appends a fixed-size metadata block, the total overhead grows linearly with hop count. In a three-hop leaf-spine fabric, the packet accumulates three metadata blocks; in a five-hop fat-tree, it accumulates five. This overhead is negligible for large data transfers but becomes significant for small RDMA messages — a problem addressed by HPCC++ below.
 
 
-## HPCC — Direct Rate Control from Telemetry
+### HPCC — Direct Rate Control from Telemetry
 
 **HPCC (High Precision Congestion Control)**, introduced by Alibaba (Li et al., SIGCOMM 2019), is the most prominent algorithm built on per-hop telemetry. It was the first to prove that a sender with real network measurements can dramatically outperform DCQCN's indirect estimation.
 
@@ -106,7 +107,7 @@ $$Rate_{new} = \frac{Rate_{current} \times U_{target}}{U_{bottleneck}}$$
 Where $U_{target}$ is the desired link utilization (e.g., 95%) and $U_{bottleneck}$ is the measured utilization at the most loaded hop. If the bottleneck link is running at 100% utilization and the target is 95%, the sender cuts its rate by exactly 5%. If the bottleneck is at 60%, the sender increases its rate. The adjustment is always proportional to the actual gap, never a blind multiplicative slash.
 
 
-## HPCC++ — Solving the Overhead Problem
+### HPCC++ — Solving the Overhead Problem
 
 HPCC's precision comes at a cost. Each switch along the path appends its own metadata block to the packet. In a multi-tier leaf-spine fabric where a packet traverses five hops, the cumulative telemetry header can grow to tens of bytes per packet. For large data transfers, this overhead is negligible. For small RoCEv2 messages (common in collective operations like all-reduce), it becomes significant.
 
@@ -194,6 +195,83 @@ A subtle but important feature of Swift is its ability to separate **fabric dela
 Swift is particularly attractive for deployments where switch telemetry support (IFA/INT/CSIG) is unavailable or incomplete, because the sender derives its signal entirely from end-host timestamps. In deployments that *do* have CSIG, Swift's delay-based logic can be augmented with CSIG's `max(PD)` signal for even higher precision. The CSIG draft itself uses Swift as its baseline congestion control algorithm and demonstrates how CSIG signals improve Swift's ramp-up and reaction accuracy.
 
 
+## Switch-Direct Backward Feedback
+
+Every congestion control mechanism discussed so far shares a common architectural assumption: the feedback signal travels **forward** through the network before being **reflected** back to the sender. In standard DCQCN, the switch marks a packet with ECN, the packet continues forward to the receiver, the receiver generates a CNP, and the CNP travels back. Even with richer signals (IFA, CSIG), this forward-then-reflect model is unchanged — the receiver is always the relay point. Swift removes the switch from the signaling path entirely, but the sender still waits for a full round-trip before it has any measurement to act on.
+
+This means the sender is blind for at least one full RTT after congestion begins. At 400 Gbps over a 4 μs fabric RTT, a single sender injects approximately 200 KB of additional data before it even *learns* there is a problem. At scale — hundreds of flows hitting the same bottleneck — this blind window is the primary reason switch buffers overflow into PFC pauses.
+
+**Switch-direct backward feedback** eliminates the receiver from the control loop. The congested switch itself generates a message directly back to the sender at the moment congestion is detected. The sender learns about the problem in roughly half the time — the signal travels directly from the congestion point to the sender, skipping the entire receiver-side leg of the loop — and the blind injection window shrinks proportionally.
+
+The idea of switch-generated backward signals is not new. [QCN](./03_CLASSIFICATION.md#the-legacy-standard-layer-2-congestion-control-ieee-8021qau--qcn) implemented it in 2010 for Layer 2 domains. When a bridge's queue exceeds a threshold, its ASIC generates a Congestion Notification Message (CNM) directly back to the source MAC address, carrying quantized feedback that enables proportional rate adjustment. QCN proved the concept in hardware but was limited to a single VLAN — it cannot cross routed boundaries. The mechanisms below extend switch-direct backward feedback to routable Layer 3 RoCEv2 fabrics.
+
+
+### Fast CNP
+
+**Fast CNP** ([draft-xiao-rtgwg-rocev2-fast-cnp](https://datatracker.ietf.org/doc/draft-xiao-rtgwg-rocev2-fast-cnp/), ZTE, 2024) applies switch-direct feedback to RoCEv2 specifically. When a switch ASIC detects congestion (queue depth exceeding threshold), it generates a CNP directly back to the sender without waiting for the receiver.
+
+<img src="../pics/fast-cnp.png" width="700"/>
+
+The key technical challenge is flow identification. The standard RoCEv2 Base Transport Header (BTH) carries only the *Destination* QP — the receiver's queue pair number. The sender needs to know its own *Source* QP to throttle the correct flow. But a sender may communicate with multiple receivers, and different receivers may use the same Destination QP mapped to different Source QPs at the sender. The Destination QP alone is ambiguous.
+
+Fast CNP solves this by prepending an IPv6 Destination Options extension header containing the original packet's destination address (the receiver's IP). The sender uses the combination of Destination QP + Destination Address to perform a unique lookup of the correct Source QP. The switch sets the Fast CNP's source IP to its own loopback address, allowing the sender to identify which switch along the path detected congestion and optionally reroute via a different ECMP path.
+
+The draft also specifies an optional IOAM (In situ OAM) payload, allowing the Fast CNP to carry per-hop telemetry from the congested switch back to the sender — combining backward feedback with rich signal data for algorithms like HPCC++.
+
+> If the switch does not know whether the sender supports Fast CNP, it MAY simultaneously mark the data packet with ECN CE (triggering the standard receiver-originated CNP as a fallback). If the switch knows the sender supports Fast CNP, it MUST NOT mark the ECN bits — avoiding a duplicate signal.
+
+
+### Bolt
+
+**Bolt** (Stanford/Google, NSDI 2023) extends the concept from simple notification to **sub-RTT congestion control** by leveraging programmable switch ASICs (P4/Tofino). Rather than generating a minimal backward notification, Bolt's switch data plane computes precise congestion signals — actual queue depths, available bandwidth, and per-flow state — and feeds them directly to the sender at the point of congestion. The sender reacts before the packet even reaches the receiver, shrinking the control loop below one RTT.
+
+Bolt is built on three hardware-level mechanisms:
+
+- **Sub-RTT Control (SRC)**: The switch pipeline detects congestion and generates backward feedback within a single packet processing cycle — no store-and-forward delay, no software involvement.
+
+- **Proactive Ramp-up (PRU)**: The switch tracks flow completions in its pipeline and signals neighboring senders to claim released bandwidth immediately, rather than waiting for the slow additive-increase ramp.
+
+- **Supply Matching (SM)**: The switch ASIC explicitly computes available bandwidth and distributes it to competing flows, replacing the sender's indirect estimation with a direct allocation.
+
+Bolt reports 80% reduction in 99th-percentile tail latency and up to 3× improvement in flow completion time compared to Swift and HPCC at 400 Gbps. It requires P4-programmable switches (e.g., Intel Tofino) and is not yet available on fixed-function merchant silicon (Broadcom Tomahawk, NVIDIA Spectrum).
+
+
+## Summary Reference
+
+### Hardware Congestion Control Algorithms
+
+All congestion control in the RoCEv2 ecosystem runs in NIC hardware or firmware — kernel bypass demands it. The table below lists every NIC-side rate control algorithm discussed in this document and its [predecessor](05_DCQCN.md), ordered chronologically.
+
+| Year | Algorithm | Execution Layer | Signal Used | Rate Adjustment |
+|------|-----------|-----------------|-------------|-----------------|
+| 2015 | DCQCN | NIC hardware (ConnectX) | Binary ECN / CNP | α-scaled multiplicative cut + phased recovery |
+| 2015 | TIMELY | NIC firmware | End-host RTT (NIC timestamps) | RTT gradient-based AIMD |
+| 2019 | HPCC | NIC hardware | Full per-hop INT/IFA telemetry | Direct: rate ∝ target utilization / bottleneck utilization |
+| 2020 | HPCC++ | NIC hardware | Probabilistic telemetry (PINT) | Same as HPCC, sampled data |
+| 2020 | Swift | NIC hardware/firmware | End-host RTT (NIC timestamps) | Proportional delay-based AIMD |
+
+### Forward-Path Signaling Mechanisms
+
+These are the in-band signals that travel with data packets toward the receiver, then get reflected back to the sender.
+
+| Mechanism | Layer | Generated By | Information Carried | Overhead |
+|-----------|-------|--------------|---------------------|----------|
+| ECN / CNP | L3 (IP) | Switch marks CE; receiver generates CNP | Binary — "congestion occurred" | None (2 bits in IP header) |
+| CSIG | L2 tag | Each switch updates tag via compare-and-replace | Bottleneck summary: min(ABW), max(delay), or max(queue depth) | Fixed (4 or 8 bytes) |
+| IFA / INT | L3+ | Each switch appends metadata block | Full per-hop: switch ID, queue depth, timestamps, ports | Grows linearly with hop count |
+| PINT | L3+ | Each switch overwrites shared field probabilistically | Same data as IFA, reconstructed statistically over many packets | Fixed (1–2 bytes) |
+
+### Switch-Direct Backward Feedback Mechanisms
+
+These are signals generated by the switch and sent directly back to the sender, bypassing the receiver.
+
+| Mechanism | Year | Switch Hardware | What It Signals | Flow ID Method | Scope |
+|-----------|------|-----------------|-----------------|----------------|-------|
+| QCN (CNM) | 2010 | Bridge ASIC (fixed-function) | Quantized congestion severity | Source MAC | L2 only (single VLAN) |
+| Bolt | 2023 | Programmable ASIC (P4/Tofino) | Precise congestion + bandwidth allocation | Programmable match-action | L3 routable |
+| Fast CNP | 2024 | Switch ASIC (fixed-function) | "Slow down" + optional IOAM telemetry | IPv6 ext header + Dest QP | L3 RoCEv2 |
+
+
 ## Programmable Congestion Control (PCC)
 
 Richer signals — whether full per-hop telemetry, CSIG bottleneck summaries, or precise delay measurements — are only useful if the sender can act on them intelligently. Standard DCQCN's Reaction Point cannot. The entire state machine (the alpha update, the three recovery phases, the clamp behavior) is burned into the NIC firmware. Network engineers can tune the parameters (`RPG_GD`, `AI`, `HAI`, `G`, etc.), but the algorithm itself cannot be changed. It has no concept of "queue depth" or "per-hop telemetry." It understands one input (CNP received: yes or no) and runs one fixed algorithm.
@@ -210,12 +288,12 @@ This means engineers can implement fundamentally different strategies depending 
 
 - A mixed workload might combine multiple signals — using IFA for full path-level diagnostics and CSIG for per-packet bottleneck bandwidth and utilization — and weight them differently depending on the traffic class.
 
-PCC does not change the three-role model (CP, NP, RP) that DCQCN established. The Congestion Point is still the switch marking packets. The Notification Point is still the receiver generating feedback. The Reaction Point is still the sender adjusting its rate. What changes is the *implementation* of the Reaction Point: from a fixed state machine with tunable parameters to a fully programmable algorithm with structured telemetry inputs.
+PCC does not change the three-role model (CP, NP, RP) that DCQCN established — it changes the *implementation* of the Reaction Point: from a fixed state machine with tunable parameters to a fully programmable algorithm with structured inputs. The Congestion Point is still the switch detecting congestion. The Notification Point is still the entity generating feedback (the receiver in forward-path mode, or the switch itself in backward-feedback mode). The Reaction Point is still the sender adjusting its rate.
 
 | Component         | Standard DCQCN                                       | Next-Generation (PCC + Telemetry)                             |
 |-------------------|------------------------------------------------------|---------------------------------------------------------------|
-| **CP (Switch)**   | Marks ECN CE bit                                     | Stamps IFA metadata and/or updates CSIG L2 tag                |
-| **NP (Receiver)** | Generates minimal CNP                                | Reflects IFA/CSIG data to sender                              |
+| **CP (Switch)**   | Marks ECN CE bit                                     | Stamps IFA/CSIG metadata, and/or generates Fast CNP directly  |
+| **NP**            | Receiver generates minimal CNP                       | Receiver reflects telemetry, or switch sends Fast CNP (backward) |
 | **RP (Sender)**   | Fixed alpha / phase A-B-C state machine in firmware  | Custom algorithm on NIC embedded cores (DOCA PCC)             |
 | **Signal**        | Binary (CNP received or not)                         | Quantitative (queue depth, per-hop path data, timestamps)     |
 | **Tunability**    | Parameter knobs (`AI`, `HAI`, `G`, `RPG_GD`, etc.)   | Entire algorithm is replaceable                               |
