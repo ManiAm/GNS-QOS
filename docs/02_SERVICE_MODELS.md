@@ -140,43 +140,13 @@ You might wonder: Doesn't a centralized controller sound a lot like the IntServ 
 
 
 
-## Switch Architecture
+## Switch Queuing Architecture
 
-### The Foundation — The Two Planes
-
-Every router or switch has two fundamentally different processing planes:
-
-- **The Control Plane** (The Brain): This is the software-driven part of the router. It handles complex, infrequent tasks like calculating routes (OSPF, BGP), negotiating agreements, and establishing the rules for how traffic should be treated.
-
-- **The Data Plane** (The Muscle): This is the hardware-driven part of the router (using ASICs). It does the actual heavy lifting of forwarding billions of packets per second. It doesn't think; it simply looks at the rules the Control Plane created and acts on them immediately.
-
-### The Transit Path
-
-We must understand how traffic moves through the Data Plane. Every packet makes a three-part physical journey:
-
-- **Ingress** (The Entrance): The physical port where a packet enters the switch. Upon arrival, the switch's forwarding engine immediately parses the packet headers to figure out where it needs to go.
-
-- **Switch Fabric** (The Internal Highway): This is the high-speed silicon backplane that connects all the ports together. Its only job is to transport the packet from the receiving Ingress port to the correct transmitting Egress port as fast as possible.
-
-- **Egress** (The Exit): The physical port where the packet leaves the switch and heads toward its next hop on the network.
-
-<img src="../pics/switch-internal.png" width="500"/>
-
-While we describe the transit path as starting at an Ingress port and ending at an Egress port, it is important to note that a single physical interface on a switch operates as both simultaneously. When a port is operating in full-duplex mode, it can receive incoming traffic (acting as Ingress) and transmit outgoing traffic (acting as Egress) at the exact same time, without the two streams interfering with one another. If a port is rated for 100 Gbps, it can technically receive 100 Gbps of data and transmit 100 Gbps of data simultaneously.
-
-### Traffic Types at Ingress
-
-Now that we know the physical path, we have to look at what is entering the Ingress port. There are three distinct types of traffic:
-
-- **Data Traffic**: Standard user traffic (videos, emails, web browsing).
-
-- **Control Traffic**: Traffic from other routers used to map out the network (routing protocol updates like BGP or OSPF).
-
-- **Management Traffic**: Traffic from a network admin logging into the device to configure it (SSH, HTTPS).
-
-The vast majority of Data traffic enters Ingress, crosses the Switch Fabric, and leaves via Egress. It never touches the CPU, allowing it to be forwarded at wire speed. This ASIC-only journey is called the **fast path**. Management and Control packets cannot just be forwarded; they require the CPU to process them. The hardware intercepts these packets in the Data Plane and diverts them up to the Control Plane for software processing. This is referred to as the **slow path**. Slow path is out of the scope of this document.
+This section covers how queues work inside a switch and why they exist. For background on the control plane and data plane, the transit path (ingress → switch fabric → egress), and traffic types (fast path vs slow path), see [Switch Architecture](https://github.com/ManiAm/net-lab-switch-setup/blob/master/docs/00_README_npu.md).
 
 ### The Need for Queues
+
+<img src="../pics/switch-internal.png" width="500"/>
 
 In a perfect world, a packet flows instantly from Ingress, across the Fabric, and out the Egress port. However, network traffic is rarely perfectly smooth; it is highly bursty. Congestion inevitably occurs—most often due to a "many-to-one" traffic pattern, where several Ingress ports simultaneously blast traffic toward a single Egress port.
 
