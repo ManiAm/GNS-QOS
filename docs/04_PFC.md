@@ -64,9 +64,7 @@ The required headroom is a function of how fast the link is transmitting and the
 
     headroom_bytes = line_rate × total_response_delay
 
-The total response delay includes every source of latency in the pause-to-stop path:
-
-- **Line rate**: The port speed in bytes per second. This is the dominant scaling factor. Doubling the speed doubles the bytes in flight during any fixed delay.
+Line rate is the port speed in bytes per second. This is the dominant scaling factor. Doubling the speed doubles the bytes in flight during any fixed delay. The total response delay includes every source of latency in the pause-to-stop path:
 
 - **Cable propagation delay**: The time for the pause frame to travel back across the physical cable. At ~5 ns/m in copper, a 5 m cable adds ~25 ns. A 300 m fiber adds ~1.5 μs.
 
@@ -110,7 +108,7 @@ Every priority group is allocated a small, dedicated block of reserved memory th
 
 ### Tier 2: Shared Pool and Dynamic Borrowing (Alpha)
 
-Once a PG fills its reserved space, it begins consuming memory from a massive, global shared buffer pool that is common across all ports. However, we cannot let one port under a heavy incast attack consume the entire shared pool, or it would starve everyone else. To prevent this, the switch uses dynamic thresholds governed by a configuration parameter called alpha ($\alpha$).
+Once a PG fills its reserved space, it begins consuming memory from a massive, global shared buffer pool that is common across all ports. However, we cannot let one port under a heavy incast attack consume the entire shared pool, or it would starve everyone else. To prevent this, the switch uses dynamic thresholds governed by a configuration parameter called `alpha` ($\alpha$).
 
 Alpha determines the maximum fraction of the currently available shared buffer that a single PG is allowed to claim. The standard dynamic threshold limit is calculated as:
 
@@ -118,13 +116,38 @@ $$\text{Max Shared Limit} = \alpha \times \text{Remaining Shared Buffer}$$
 
 Because the "remaining shared buffer" changes in real time as other ports consume or release memory, the limit is dynamic. A port experiencing a massive traffic burst can temporarily borrow deep into the shared pool if other ports are idle. As those idle ports wake up and start receiving traffic, the available shared buffer shrinks, which automatically tightens the limit for the congested port.
 
-- **High Alpha** (e.g., 8): The PG is permitted to claim a large multiple of the remaining buffer, allowing it to absorb massive bursts. This is standard for lossless RoCE classes (e.g., PG3) to prevent unnecessary PFC pauses.
+- **High Alpha**: The PG is permitted to claim a large multiple of the remaining buffer, allowing it to absorb massive bursts. This is standard for lossless RoCE classes (e.g., PG3) to prevent unnecessary PFC pauses.
 
-- **Low Alpha** (e.g., 1 or fractions): The PG is restricted to a much smaller share. This is typical for lossy traffic classes (e.g., PG0 for standard TCP) where occasional drops are acceptable, protecting the switch from buffer starvation.
+- **Low Alpha**: The PG is restricted to a much smaller share. This is typical for lossy traffic classes (e.g., PG0 for standard TCP) where occasional drops are acceptable, protecting the switch from buffer starvation.
 
 A PG continues to grow into the shared pool until its total occupancy reaches the Xoff threshold. At that point, the switch fires a PFC Pause frame to halt the upstream sender.
 
-> Naming note: The buffer management alpha ($\alpha$) is completely unrelated to the DCQCN alpha ($\alpha$) used as a congestion severity score in a sender's rate control algorithm. They share a Greek letter but operate in entirely different domains. One lives in the switch ASIC's memory controller, the other in the NIC's congestion control state machine.
+> Naming note: The buffer management alpha is completely unrelated to the [DCQCN alpha](./05_DCQCN.md#measuring-congestion-severity-the-alpha-alpha-parameter) used as a congestion severity score in a sender's rate control algorithm. They share a Greek letter but operate in entirely different domains. One lives in the switch ASIC's memory controller, the other in the NIC's congestion control state machine.
+
+**Alpha Values and the Power-of-2 Convention**
+
+The alpha multiplier is not an arbitrary real number. Switch MMU hardware implements it as a power of 2, giving a discrete set of values from very restrictive (alpha < 1) to effectively unlimited (alpha >> 1). In the [SAI (Switch Abstraction Interface)](https://github.com/opencomputeproject/SAI) used by SONiC, alpha is configured indirectly through an integer exponent called `dynamic_th`:
+
+$$\alpha = 2^{\,n}$$
+
+Where $n$ is the configured `dynamic_th` integer value.
+
+The `dynamic_th` parameter ranges from **−8 to +8**, yielding alpha values from 1/256 to 256:
+
+| `dynamic_th` | Alpha (multiplier) | Effect on PG |
+|--------------|--------------------|-----------------------------------------|
+| −8           | 1/256              | Near-zero shared borrowing — PG is almost entirely confined to its reserved pool |
+| −3           | 1/8                | Heavily restricted — can only claim 12.5% of remaining free buffer |
+| 0            | 1                  | Balanced — PG can claim up to 1× the remaining free buffer |
+| 1            | 2                  | Moderate — typical for lossy traffic classes (e.g., PG0) |
+| 3            | 8                  | Generous — PG can claim up to 8× remaining free buffer |
+| 8            | 256                | Effectively unlimited — PG can absorb the entire shared pool. Typical for lossless RoCE (e.g., PG3) |
+
+When alpha > 1, the formula produces a threshold *larger* than the remaining free buffer. This does not mean the PG can exceed physical memory — the ASIC still enforces the hard limit of total shared pool size. A high alpha simply means "do not artificially restrict this PG; let it consume whatever is physically available before firing PFC."
+
+When alpha < 1, the PG is restricted to a fraction of the free buffer. Multiple low-alpha PGs sharing the same pool naturally divide it among themselves: if 8 PGs each have alpha = 1/8, each can claim at most 12.5% of the free space, leaving room for all of them simultaneously.
+
+This exponent-based representation is standard across SAI-compliant implementations (Broadcom Trident/Tomahawk, NVIDIA Spectrum, Intel Tofino). Vendor-native CLIs may display the value differently — for example, as a raw multiplier or a named profile — but the underlying hardware mechanism and formula are identical.
 
 ### Tier 3: Headroom (In-Flight Absorption)
 
@@ -132,7 +155,7 @@ After the Xoff signal fires, the headroom pool absorbs the packets that were alr
 
 **Dedicated Headroom (Traditional)**
 
-Each lossless PG on each port gets its own private headroom reservation, carved out at configuration time. This memory cannot be shared with or borrowed by other ports. It guarantees that in-flight packets always have a place to land, regardless of how congested the rest of the switch is. The downside is cost: on a 64-port 800G switch with two lossless PGs per port (e.g., one for RDMA data, one for CNPs), each needing ~384 KB of headroom, dedicated headroom alone can consume ~48 MB — a significant fraction of the total on-chip buffer (e.g., 30% of a 160 MB ASIC).
+Each lossless PG on each port gets its own private headroom reservation, carved out at configuration time. This memory cannot be shared with or borrowed by other ports — in-flight packets are guaranteed a place to land regardless of congestion elsewhere. The downside is cost: on a 64-port 800G switch with two lossless PGs per port, dedicated headroom alone can consume ~48 MB (~30% of a 160 MB ASIC).
 
 **Shared Headroom Pool (SHP)**
 
