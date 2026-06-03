@@ -208,17 +208,53 @@ The idea of switch-generated backward signals is not new. [QCN](./03_CLASSIFICAT
 
 ### Fast CNP
 
-**Fast CNP** ([draft-xiao-rtgwg-rocev2-fast-cnp](https://datatracker.ietf.org/doc/draft-xiao-rtgwg-rocev2-fast-cnp/), ZTE, 2024) applies switch-direct feedback to RoCEv2 specifically. When a switch ASIC detects congestion (queue depth exceeding threshold), it generates a CNP directly back to the sender without waiting for the receiver.
+**Fast CNP** ([draft-xiao-rtgwg-rocev2-fast-cnp](https://datatracker.ietf.org/doc/draft-xiao-rtgwg-rocev2-fast-cnp/)) applies switch-direct backward feedback to RoCEv2. The draft is scoped to IPv6 only.
 
 <img src="../pics/fast-cnp.png" width="700"/>
 
-The key technical challenge is flow identification. The standard RoCEv2 Base Transport Header (BTH) carries only the *Destination* QP — the receiver's queue pair number. The sender needs to know its own *Source* QP to throttle the correct flow. But a sender may communicate with multiple receivers, and different receivers may use the same Destination QP mapped to different Source QPs at the sender. The Destination QP alone is ambiguous.
+**How it works:**
 
-Fast CNP solves this by prepending an IPv6 Destination Options extension header containing the original packet's destination address (the receiver's IP). The sender uses the combination of Destination QP + Destination Address to perform a unique lookup of the correct Source QP. The switch sets the Fast CNP's source IP to its own loopback address, allowing the sender to identify which switch along the path detected congestion and optionally reroute via a different ECMP path.
+1. A switch detects congestion (queue depth exceeds threshold) on an egress port.
 
-The draft also specifies an optional IOAM (In situ OAM) payload, allowing the Fast CNP to carry per-hop telemetry from the congested switch back to the sender — combining backward feedback with rich signal data for algorithms like HPCC++.
+2. Instead of marking the data packet with ECN and relying on the receiver to generate a CNP, the switch constructs a Fast CNP itself and sends it directly back to the sender.
 
-> If the switch does not know whether the sender supports Fast CNP, it MAY simultaneously mark the data packet with ECN CE (triggering the standard receiver-originated CNP as a fallback). If the switch knows the sender supports Fast CNP, it MUST NOT mark the ECN bits — avoiding a duplicate signal.
+3. The sender receives the Fast CNP, identifies the affected flow, and reduces its transmission rate — all without waiting for the data packet to reach the receiver and a standard CNP to return.
+
+**The flow identification problem:**
+
+For the sender to throttle the correct flow, it needs to know which of its Source QPs caused the congestion. In a standard CNP, this is straightforward: the receiver knows the full QP mapping from the connection setup. A switch in the middle of the path does not have this knowledge. It can only see the Destination QP (the receiver's queue pair) in the packet's Base Transport Header.
+
+The Destination QP alone is ambiguous. A sender may communicate with multiple receivers, and different receivers may use the same Destination QP number mapped to different Source QPs at the sender. The switch cannot tell them apart.
+
+**The solution:**
+
+Fast CNP prepends an IPv6 Destination Options extension header to the CNP. This header contains the **original destination IPv6 address** (the receiver's IP) copied from the congested data packet. The sender receives the Fast CNP and uses two pieces of information together to perform a unique lookup:
+
+- **Destination QP** (from the BTH) — identifies the receiver's queue pair
+- **Destination Address** (from the IPv6 extension header) — identifies which receiver
+
+This combination uniquely resolves to the correct Source QP at the sender.
+
+Additionally, the switch sets the Fast CNP's **source IP address** to its own loopback address. This tells the sender exactly which switch along the path detected congestion, enabling optional ECMP rerouting around the bottleneck.
+
+**Two option formats:**
+
+The draft defines two variants of the IPv6 destination option:
+
+| Format        | Contents | Use Case |
+|---------------|----------|----------|
+| **Basic**     | Original destination IPv6 address (16 bytes) | Standard rate reduction — sender identifies the flow and applies its normal CC algorithm |
+| **With IOAM** | Original destination address + In situ OAM Trace Data | Telemetry-aware rate reduction — sender uses per-hop congestion data (e.g., for HPCC++) |
+
+**Backward compatibility:**
+
+If the switch does not know whether the sender supports Fast CNP, it MAY simultaneously mark the data packet with ECN CE. This triggers the standard receiver-originated CNP as a fallback — the sender will react to whichever signal arrives first. If the switch knows the sender supports Fast CNP, it MUST NOT mark the ECN bits, avoiding a duplicate signal.
+
+**Deployment and status:**
+
+Fast CNP must be deployed within a controlled administrative domain with rate-limiting on generation, source-address filtering, and border filtering to prevent Fast CNPs from entering or leaving the domain. The feature must be disabled by default.
+
+> As of version 05 (May 2026), Fast CNP remains an individual Internet-Draft — it has not been adopted by an IETF working group and should be considered a proposal, not a ratified standard.
 
 
 ### Bolt
