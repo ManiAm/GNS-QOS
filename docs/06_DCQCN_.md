@@ -10,87 +10,13 @@ The evolution beyond standard DCQCN follows three threads:
 - A programmable engine that lets the sender act on any of these signals with custom logic
 
 
-## Per-Hop Telemetry (INT and IFA)
+## Per-Hop In-band Telemetry Applied to Congestion Control
 
-The most ambitious answer to the binary signal problem is per-hop telemetry: instrumenting the network so that switches stamp metadata — their identity, the ports used, the instantaneous queue depth, and nanosecond-precision timestamps — into packets as they transit the fabric. By the time a telemetry-carrying packet reaches its destination, it holds a complete, ordered record of every switch it touched and the congestion state at each one.
+[In-band network telemetry](07_PerHop_Inband_Telemetry.md) such as INT or IFA enables switches to stamp real-time metadata — queue depth, link utilization, timestamps — directly into data packets as they traverse the fabric. By the time a packet reaches its destination, it carries a complete record of conditions at every hop.
 
-This idea was first realized by **In-Network Telemetry (INT)**, developed by Barefoot Networks (now Intel) around 2015–2016 as part of the P4 programmable switch ecosystem. INT was specified by the P4.org Applications Working Group and designed for programmable Tofino ASICs.
+It is important to note that in-band network telemetry is **not** a congestion control algorithm. It is general-purpose telemetry infrastructure with applications ranging from network monitoring to fault isolation. However, it provides the richest possible input signal for a congestion control algorithm — replacing DCQCN's binary "congested or not" with actual per-hop measurements that a sender can act on directly.
 
-**In-Band Flow Analytics (IFA)** is Broadcom's independent implementation of the same concept, designed for their fixed-function ASICs (Trident and Tomahawk). IFA was submitted to the IETF for industry-wide standardization and is documented as an Internet-Draft in the IP Performance Measurement (IPPM) working group ([draft-kumar-ippm-ifa](https://datatracker.ietf.org/doc/draft-kumar-ippm-ifa/)), now at version 2 (IFAv2).
-
-IFA is a general-purpose telemetry standard — not specific to RDMA or RoCEv2. It can stamp telemetry into any IP packet that matches a configured policy. Its broader uses include network monitoring, path tracing, and SLA verification. However, congestion control for lossless RDMA fabrics is one of its most impactful applications, because the standard DCQCN feedback loop provides so little information to work with.
-
-> INT and IFA are conceptually identical but not wire-compatible. They carry the same per-hop information using different header formats and target different switch silicon. For the purposes of congestion control, they are interchangeable: both provide the same queue depth, utilization, and timing data that a sender's rate-control algorithm needs.
-
-### Operational Modes
-
-The IFA standard ([draft-kumar-ippm-ifa-08](https://datatracker.ietf.org/doc/draft-kumar-ippm-ifa/)) defines three roles within an **IFA zone** — the monitored domain. An **Initiating node** at the edge marks or clones selected traffic, **Transit nodes** inside the zone append their metadata to every IFA-marked packet they forward, and a **Terminating node** at the far edge collects the accumulated telemetry. The standard defines two operational modes, controlled by the **I (Inband)** flag in the IFA header:
-
-- **Inband mode (I = 1)** — Telemetry is inserted directly into live data packets. Every matched packet receives metadata at every transit hop. The Terminating node strips the IFA headers and forwards the original packet to its destination. The draft describes this as inserting metadata "on a per packet basis in live traffic."
-
-- **Clone mode (I = 0)** — Rather than modifying live traffic, the Initiating node creates synthetic copies of selected packets, inserts the IFA header into the clone, and forwards both. Only the clones carry telemetry and accumulate metadata at each transit hop; the original data packets traverse the network untouched. The Terminating node drops the clones after extracting the telemetry and reporting it to a collector.
-
-The choice between modes is made at the Initiating node through configuration. Transit switches do not distinguish between the two — they see an IFA-marked packet and stamp it unconditionally.
-
-> **Sampling in clone mode:** Cloning every packet would double the traffic on the fabric, so the draft requires that cloned traffic "be at a sampled ratio to keep the network overhead to a minimum." The Initiating node selects only a subset of matched packets — for example, one per burst — and clones only those. The sampling ratio is an implementation choice; for congestion control purposes, one probe per burst is sufficient because rate adjustments only need to happen once per transmission window, not once per packet.
-
-### Packet Lifecycle
-
-The following diagram illustrates how per-hop telemetry accumulates in **inband mode** as a packet traverses the network fabric.
-
-<img src="../pics/ifa.png" width="500"/>
-
-The source server transmits a standard data packet (Step 1). As this packet moves through the network (Steps 2, 3, and 4), each telemetry-enabled switch recognizes the IFA header, inserts its own metadata block, and forwards the packet. The packet builds a chronological, stacked record of its journey and the precise conditions at every node it passed through.
-
-Upon reaching the destination server, the Terminating node extracts the complete telemetry stack, strips the IFA headers, and delivers the original payload. The receiving NIC embeds the extracted multi-hop metadata into the returning ACK packet (Step 5). When the original sender receives this ACK, its congestion control engine uses the full path-level view to pinpoint the exact location and severity of any congestion, and adjusts the flow rate accordingly (Step 6).
-
-In **clone mode**, the lifecycle is similar except the telemetry rides in a separate probe packet — not in the data packet itself. The probe follows the same network path and queues as the data flow it represents, so it experiences the same congestion conditions. The Terminating node drops the probe and reports the telemetry to a collector or reflects it back to the sender.
-
-
-### Header Format
-
-Per-hop telemetry metadata is not stored in the IP header or any existing protocol field. Instead, each switch inserts a metadata block between the packet's transport header (e.g., UDP) and the original payload — the default placement, called **payload stamping**. The standard also defines **tail stamping**, where metadata is appended after the payload before the FCS, which preserves layer-5 visibility for legacy devices. Each hop appends its own metadata block to a growing stack, so the headers accumulate in chronological order as the packet traverses the fabric.
-
-```
-┌────────────────────────────┐
-│  Ethernet Header           │
-├────────────────────────────┤
-│  IP Header                 │
-├────────────────────────────┤
-│  UDP / TCP Header          │
-├────────────────────────────┤
-│  Telemetry Header (fixed)  │  Protocol indicator, max hop count, current length
-├────────────────────────────┤
-│  Metadata — Hop 1          │  ◄── Inserted by first switch
-├────────────────────────────┤
-│  Metadata — Hop 2          │  ◄── Appended by second switch
-├────────────────────────────┤
-│  Metadata — Hop N          │  ◄── Appended by Nth switch
-├────────────────────────────┤
-│  Original Payload          │
-└────────────────────────────┘
-```
-
-The fixed header at the top of the stack contains bookkeeping fields: a protocol identifier, the maximum number of hops allowed, and the current metadata length (updated by each switch as it appends). The IFA standard also defines a **Hop Limit** field — each transit node decrements it, and once it reaches zero, subsequent nodes must stop inserting metadata. Together, Max Length and Hop Limit act as safety bounds that prevent unbounded header growth.
-
-### Per-Hop Metadata
-
-The actual content of each per-hop metadata block is not fixed by the standard. IFA uses a namespace system: a **Global Name Space (GNS)** configured zone-wide, or a **Local Name Space (LNS)** defined per hop. The GNS dictates which fields every switch in the zone must insert (uniform mode), while LNS allows each hop to include its own most relevant data (non-uniform mode). The only field fixed by the standard itself is a 28-bit **Device ID**; everything else is profile-dependent.
-
-The table below shows a representative telemetry profile commonly used for congestion-aware applications:
-
-| Field              | Description                                                                |
-|--------------------|----------------------------------------------------------------------------|
-| **Switch ID**      | Unique identifier of the switch that inserted this metadata block.         |
-| **Ingress Port**   | The physical port where the packet entered this switch.                    |
-| **Egress Port**    | The physical port where the packet left this switch.                       |
-| **Queue Depth**    | The instantaneous occupancy of the egress queue at the moment of transit.  |
-| **Ingress Timestamp** | Nanosecond-precision time when the packet arrived at this switch.       |
-| **Egress Timestamp**  | Nanosecond-precision time when the packet departed this switch.         |
-| **Queue ID**       | The specific queue (Traffic Class) the packet was placed into.             |
-
-Because each switch appends a fixed-size metadata block, the total overhead grows linearly with hop count. In a three-hop leaf-spine fabric, the packet accumulates three metadata blocks; in a five-hop fat-tree, it accumulates five. This overhead is negligible for large data transfers but becomes significant for small RDMA messages — a problem addressed by HPCC++ below.
-
+The overhead trade-off is straightforward: each switch appends a fixed-size metadata block, so total overhead grows linearly with hop count. This is negligible for large data transfers but significant for small RDMA messages.
 
 ### HPCC — Direct Rate Control from Telemetry
 
@@ -241,9 +167,9 @@ Additionally, the switch sets the Fast CNP's **source IP address** to its own lo
 
 The draft defines two variants of the IPv6 destination option:
 
-| Format        | Contents | Use Case |
-|---------------|----------|----------|
-| **Basic**     | Original destination IPv6 address (16 bytes) | Standard rate reduction — sender identifies the flow and applies its normal CC algorithm |
+| Format        | Contents                                              | Use Case |
+|---------------|-------------------------------------------------------|----------|
+| **Basic**     | Original destination IPv6 address (16 bytes)          | Standard rate reduction — sender identifies the flow and applies its normal CC algorithm |
 | **With IOAM** | Original destination address + In situ OAM Trace Data | Telemetry-aware rate reduction — sender uses per-hop congestion data (e.g., for HPCC++) |
 
 **Backward compatibility:**
@@ -280,32 +206,32 @@ All congestion control in the RoCEv2 ecosystem runs in NIC hardware or firmware 
 
 | Year | Algorithm | Execution Layer | Signal Used | Rate Adjustment |
 |------|-----------|-----------------|-------------|-----------------|
-| 2015 | DCQCN | NIC hardware (ConnectX) | Binary ECN / CNP | α-scaled multiplicative cut + phased recovery |
-| 2015 | TIMELY | NIC firmware | End-host RTT (NIC timestamps) | RTT gradient-based AIMD |
-| 2019 | HPCC | NIC hardware | Full per-hop INT/IFA telemetry | Direct: rate ∝ target utilization / bottleneck utilization |
-| 2020 | HPCC++ | NIC hardware | Probabilistic telemetry (PINT) | Same as HPCC, sampled data |
-| 2020 | Swift | NIC hardware/firmware | End-host RTT (NIC timestamps) | Proportional delay-based AIMD |
+| 2015 | DCQCN     | NIC hardware (ConnectX) | Binary ECN / CNP | α-scaled multiplicative cut + phased recovery |
+| 2015 | TIMELY    | NIC firmware | End-host RTT (NIC timestamps) | RTT gradient-based AIMD |
+| 2019 | HPCC      | NIC hardware | Full per-hop INT/IFA telemetry | Direct: rate ∝ target utilization / bottleneck utilization |
+| 2020 | HPCC++    | NIC hardware | Probabilistic telemetry (PINT) | Same as HPCC, sampled data |
+| 2020 | Swift     | NIC hardware/firmware | End-host RTT (NIC timestamps) | Proportional delay-based AIMD |
 
 ### Forward-Path Signaling Mechanisms
 
 These are the in-band signals that travel with data packets toward the receiver, then get reflected back to the sender.
 
-| Mechanism | Layer | Generated By | Information Carried | Overhead |
-|-----------|-------|--------------|---------------------|----------|
-| ECN / CNP | L3 (IP) | Switch marks CE; receiver generates CNP | Binary — "congestion occurred" | None (2 bits in IP header) |
-| CSIG | L2 tag | Each switch updates tag via compare-and-replace | Bottleneck summary: min(ABW), max(delay), or max(queue depth) | Fixed (4 or 8 bytes) |
-| IFA / INT | L3+ | Each switch appends metadata block | Full per-hop: switch ID, queue depth, timestamps, ports | Grows linearly with hop count |
-| PINT | L3+ | Each switch overwrites shared field probabilistically | Same data as IFA, reconstructed statistically over many packets | Fixed (1–2 bytes) |
+| Mechanism     | Layer   | Generated By | Information Carried | Overhead |
+|---------------|---------|--------------|---------------------|----------|
+| ECN / CNP     | L3 (IP) | Switch marks CE; receiver generates CNP | Binary — "congestion occurred" | None (2 bits in IP header) |
+| CSIG          | L2 tag  | Each switch updates tag via compare-and-replace | Bottleneck summary: min(ABW), max(delay), or max(queue depth) | Fixed (4 or 8 bytes) |
+| IFA / INT     | L3+     | Each switch appends metadata block | Full per-hop: switch ID, queue depth, timestamps, ports | Grows linearly with hop count |
+| PINT          | L3+     | Each switch overwrites shared field probabilistically | Same data as IFA, reconstructed statistically over many packets | Fixed (1–2 bytes) |
 
 ### Switch-Direct Backward Feedback Mechanisms
 
 These are signals generated by the switch and sent directly back to the sender, bypassing the receiver.
 
-| Mechanism | Year | Switch Hardware | What It Signals | Flow ID Method | Scope |
-|-----------|------|-----------------|-----------------|----------------|-------|
-| QCN (CNM) | 2010 | Bridge ASIC (fixed-function) | Quantized congestion severity | Source MAC | L2 only (single VLAN) |
-| Bolt | 2023 | Programmable ASIC (P4/Tofino) | Precise congestion + bandwidth allocation | Programmable match-action | L3 routable |
-| Fast CNP | 2024 | Switch ASIC (fixed-function) | "Slow down" + optional IOAM telemetry | IPv6 ext header + Dest QP | L3 RoCEv2 |
+| Mechanism | Year | Switch Hardware               | What It Signals                           | Flow ID Method            | Scope |
+|-----------|------|-------------------------------|-------------------------------------------|---------------------------|-------|
+| QCN (CNM) | 2010 | Bridge ASIC (fixed-function)  | Quantized congestion severity             | Source MAC                | L2 only (single VLAN) |
+| Bolt      | 2023 | Programmable ASIC (P4/Tofino) | Precise congestion + bandwidth allocation | Programmable match-action | L3 routable |
+| Fast CNP  | 2024 | Switch ASIC (fixed-function)  | "Slow down" + optional IOAM telemetry     | IPv6 ext header + Dest QP | L3 RoCEv2 |
 
 
 ## Programmable Congestion Control (PCC)
