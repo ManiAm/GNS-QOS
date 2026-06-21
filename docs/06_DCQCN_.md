@@ -16,15 +16,21 @@ The evolution beyond standard DCQCN follows three threads:
 
 It is important to note that in-band network telemetry is **not** a congestion control algorithm. It is general-purpose telemetry infrastructure with applications ranging from network monitoring to fault isolation. However, it provides the richest possible input signal for a congestion control algorithm — replacing DCQCN's binary "congested or not" with actual per-hop measurements that a sender can act on directly.
 
+Using per-hop telemetry for congestion control requires a different data-path architecture than standard monitoring. In the latter, the egress switch acts as the Terminating node — it strips all metadata headers and exports the metadata to an external collector; the destination host never sees the telemetry.
+
+For congestion control, this model must change: the telemetry must reach the **destination NIC**, which acts as the terminator. The receiving NIC parses the per-hop metadata from the arriving packet, extracts the measurements (queue depths, link utilization, timestamps), and reflects them back to the sender. The sender's rate-control engine then computes its new transmission rate directly from these measurements. Both the sender and receiver NICs must understand the telemetry format: the receiver to extract and reflect, the sender to interpret and act.
+
+<img src="../pics/ifa-cc.png" width="500"/>
+
+In practice, HPCC (below) demonstrated this with custom NIC firmware and INT in inband mode — switches stamp metadata without stripping it, and the end-host stack handles termination. IFA is a Broadcom-originated protocol, and NIC-level support is limited to Broadcom's own **NetXtreme E-Series** adapters, which implement IFA 2.0 initiation, termination, and metadata insertion in hardware (configurable via the NICCLI `udcc --ifa` interface).
+
 The overhead trade-off is straightforward: each switch appends a fixed-size metadata block, so total overhead grows linearly with hop count. This is negligible for large data transfers but significant for small RDMA messages.
 
 ### HPCC — Direct Rate Control from Telemetry
 
-**HPCC (High Precision Congestion Control)**, introduced by Alibaba (Li et al., SIGCOMM 2019), is the most prominent algorithm built on per-hop telemetry. It was the first to prove that a sender with real network measurements can dramatically outperform DCQCN's indirect estimation.
+**HPCC (High Precision Congestion Control)**, introduced by Alibaba (Li et al., SIGCOMM 2019), is the most prominent algorithm built on per-hop telemetry and the first to replace DCQCN's indirect estimation with direct network measurements.
 
-Standard DCQCN's rate adjustment is inherently indirect. The sender never learns the actual state of the network. It receives a binary CNP, updates an estimated severity score ($\alpha$), and applies a multiplicative formula. The resulting rate is a guess — an educated one, but a guess nonetheless. If the congestion is mild, the sender may over-correct and waste bandwidth. If the congestion is severe, the sender may under-correct and trigger PFC.
-
-HPCC eliminates this guesswork. It requires every switch on the path to stamp per-hop telemetry into data packets (the original paper used INT in inband mode). By the time the packet reaches the receiver, it carries the actual link utilization and queue depth recorded at every hop. The receiver reflects this telemetry back to the sender, and the sender computes its new rate directly from the measurements.
+It requires every switch on the path to stamp per-hop telemetry into data packets (the original paper used INT in inband mode). By the time the packet reaches the receiver, it carries the actual link utilization and queue depth recorded at every hop. The receiver reflects this telemetry back to the sender, and the sender computes its new rate directly from these measurements.
 
 The algorithm is straightforward: the sender scans the per-hop telemetry, finds the hop with the highest utilization, and sets its transmission rate to drive that bottleneck link toward a target utilization (typically 95%). There is no alpha, no phased recovery, no additive or hyper-additive increase. The rate is calculated from a single formula applied to real data:
 
@@ -52,7 +58,7 @@ Full per-hop telemetry provides maximum visibility but is not always necessary o
 
 CSIG addresses this with a fundamentally different architectural approach from IFA/INT. Rather than stacking per-hop metadata that grows with each switch, CSIG uses a fixed-size **L2 tag** (4 bytes compact, 8 bytes expanded) positioned between the MAC and IP headers — structurally similar to a VLAN tag. As a packet traverses the fabric, each switch performs a **compare-and-replace** on the same tag: if the switch's local congestion metric is worse than the value already in the tag, it overwrites it; otherwise, it leaves the tag untouched. By the time the packet arrives at its destination, the tag carries the **bottleneck summary** for the entire path — not a per-hop breakdown, but the single worst value.
 
-<img src="../pics/csig-tag.png" width="650"/>
+<img src="../pics/csig-tag.png" width="700"/>
 
 CSIG was developed by Google and submitted to the IETF as an Internet-Draft ([draft-ravi-ippm-csig](https://datatracker.ietf.org/doc/draft-ravi-ippm-csig/)), with co-authorship from Broadcom. It is also being standardized by the Ultra Ethernet Consortium (UEC) as part of the UE 1.1 specification. NVIDIA supports CSIG in Spectrum-4 switches and ConnectX-8 NICs, but the protocol is an open, multi-vendor standard — not proprietary.
 
@@ -136,7 +142,7 @@ The idea of switch-generated backward signals is not new. [QCN](./03_CLASSIFICAT
 
 **Fast CNP** ([draft-xiao-rtgwg-rocev2-fast-cnp](https://datatracker.ietf.org/doc/draft-xiao-rtgwg-rocev2-fast-cnp/)) applies switch-direct backward feedback to RoCEv2. The draft is scoped to IPv6 only.
 
-<img src="../pics/fast-cnp.png" width="700"/>
+<img src="../pics/fast-cnp.png" width="750"/>
 
 **How it works:**
 
