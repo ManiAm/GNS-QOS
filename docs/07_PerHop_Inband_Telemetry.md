@@ -55,7 +55,7 @@ The choice between modes is made at the Initiating node through configuration. T
 
 An IFAv2 packet is identified by setting the IP header's protocol field to **253 (0xFD)**, a value from the IANA-reserved experimental range (253–254) designated for experimentation and testing by RFC 3692. The Initiating node overwrites the original protocol value (e.g., 17 for UDP) with `0xFD` and saves the original in a dedicated field within the IFA Header so the Terminating node can restore the packet after stripping telemetry.
 
-This L3-based detection allows IFAv2 to work across existing IP fabrics without requiring tunnel encapsulation, VXLAN awareness, or IP options support. Non-IFA-aware routers forward the packet normally — the protocol number is opaque to standard L3 forwarding decisions.
+This L3-based detection allows IFAv2 to work across existing IP fabrics without requiring IP options support or special protocol extensions. Non-IFA-aware routers forward the packet normally — the protocol number is opaque to standard L3 forwarding decisions. For VXLAN fabrics, IFA can be applied to the outer (post-encapsulation) packet so that spine switches retain visibility; see [IFA and VXLAN Tunnels](#ifa-and-vxlan-tunnels) below.
 
 
 ## Packet Lifecycle
@@ -200,3 +200,45 @@ Several approaches address this:
 | **CSIG**      | Fixed (4 or 8 bytes) | Bottleneck summary only (worst hop)         |
 
 > CSIG and its congestion-signaling semantics are covered in detail in [Beyond Standard DCQCN](06_DCQCN_.md).
+
+
+## IFA and VXLAN Tunnels
+
+IFA detection depends entirely on the IP protocol field: a transit switch identifies an IFA-marked packet by matching `IP.protocol == 0xFD`. This works in a flat routed L3 fabric where every hop sees the same IP header. In EVPN-VXLAN fabrics — where leaf switches encapsulate tenant traffic in a VXLAN tunnel before forwarding it across the spine layer — this creates a potential visibility problem.
+
+### The Problem: IFA on the Inner Packet
+
+If IFA were applied to the inner (tenant) packet before [VXLAN encapsulation](https://github.com/ManiAm/GNS-DC-VXLAN/blob/master/docs/02_vxlan.md#the-vxlan-frame-format), the IFA-marked inner packet would become the payload of an outer IP/UDP/VXLAN header. The outer IP header carries protocol 17 (UDP) with destination port 4789. Spine switches along the tunnel path would forward the packet based on the outer headers alone — they would see a normal UDP packet, not an IFA-marked one. They could not detect the inner `0xFD` protocol field, could not locate the IFA Metadata Header, and therefore could not append their own per-hop metadata entries. Telemetry coverage would be lost for every hop inside the tunnel.
+
+<img src="../pics/ifa-vxlan.png" width="500"/>
+
+### The Solution: IFA on the Outer Packet
+
+The practical solution — implemented by Juniper on their QFX Series ([documentation](https://www.juniper.net/documentation/us/en/software/junos/flow-monitoring/topics/topic-map/ifa2.0-probe-for-real-time-performance-monitoring.html)) — is to apply IFA to the **outer** (post-encapsulation) packet rather than the inner one. The initiator leaf first performs standard VXLAN encapsulation, then applies IFA headers to the resulting outer IP packet using a three-pass pipeline mechanism. The outer IP protocol is rewritten to `0xFD`, making the packet visible to IFA transit processing at every subsequent hop.
+
+<img src="../pics/ifa-vxlan-fixed.png" width="500"/>
+
+With this approach, spine switches see `IP.protocol == 0xFD` on the outer header and stamp their metadata normally. The terminator leaf strips the IFA headers from the outer packet, exports the telemetry to a collector, and then processes the VXLAN decapsulation as usual. Per-hop telemetry coverage is preserved across the entire fabric path — leaf, spine, and leaf — without any gap.
+
+```
+Leaf-1 (initiator)          Spine (transit)          Leaf-2 (terminator)
+┌─────────────────┐         ┌───────────┐           ┌─────────────────┐
+│ 1. VXLAN encap  │         │           │           │ 1. Strip IFA    │
+│ 2. Apply IFA to │──────>  │ Stamps    │ ──────>   │ 2. Export to    │
+│    outer packet │         │ metadata  │           │    collector    │
+│ 3. Forward      │         │           │           │ 3. VXLAN decap  │
+└─────────────────┘         └───────────┘           └─────────────────┘
+outer IP proto=0xFD         sees 0xFD               strips IFA first
+```
+
+Key implementation details from Juniper's QFX platform:
+
+- **Flow-type configuration** — The initiator and terminator nodes are configured with `flow-type vxlan`, which tells the IFA pipeline to operate on the outer packet post-encapsulation. Transit (spine) nodes do not need flow-type configuration — they simply process any packet with `IP.protocol == 0xFD` regardless of what it carries.
+
+- **Mutually exclusive** — A device cannot be configured for both L3 and VXLAN IFA flows simultaneously. The `flow-type` setting (L3 or VXLAN) applies device-wide.
+
+- **Three-pass mechanism** — Applying IFA after VXLAN encapsulation requires the packet to loop back through the forwarding pipeline. The first pass performs VXLAN encapsulation, the second applies IFA headers to the outer IP, and the third forwards the packet.
+
+### Contrast with IOAM
+
+IOAM (RFC 9197) takes a different approach to tunnel compatibility. Rather than applying telemetry to the outer packet, IOAM defines explicit options for carrying telemetry data *within* tunnel encapsulation headers — IPv6 extension headers, NSH, GRE, and Geneve. This allows IOAM metadata to be inserted into the tunnel header itself, so transit switches that process the tunnel encapsulation can participate in per-hop stamping. IFA's approach of stamping the outer IP layer achieves the same goal through a different mechanism — one that works with existing VXLAN fabrics without requiring tunnel-header awareness in the telemetry protocol.
