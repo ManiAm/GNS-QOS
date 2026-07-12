@@ -34,9 +34,9 @@ IntServ provides mathematically guaranteed performance but cannot scale. It forc
 
 Because IntServ couldn't scale, engineers created DiffServ, which is the undisputed standard used in modern networking today. Instead of tracking millions of individual flows, DiffServ groups traffic into broad categories (classes) and splits the workload between the edges of the network and the core.
 
-- **Edge Routers** (The Bouncers): These sit at the boundary of a network. They run a **Multi-Field (MF) Classifier** that deeply inspects incoming packets (source/destination IP, TCP/UDP port, protocol) to identify unmarked traffic, checks if the traffic violates bandwidth limits, and stamps the packet's header.
+- **Edge Routers**: These sit at the boundary of a network. They run a **Multi-Field (MF) Classifier** that deeply inspects incoming packets (source/destination IP, TCP/UDP port, protocol) to identify unmarked traffic, checks if the traffic violates bandwidth limits, and stamps the packet's header.
 
-- **Core Routers** (The Fast Sorters): These sit inside the network. They run a **Behavior Aggregate (BA) Classifier** that reads the stamp left by the edge and places the packet into the appropriate hardware queue. Because they are stateless, they can forward at line rate and scale indefinitely.
+- **Core Routers**: These sit inside the network. They run a **Behavior Aggregate (BA) Classifier** that reads the stamp left by the edge and places the packet into the appropriate hardware queue. Because they are stateless, they can forward at line rate and scale indefinitely.
 
 <img src="../pics/diffServ.png" width="500"/>
 
@@ -60,11 +60,11 @@ When a core router reads a DSCP stamp, it applies a specific behavior:
 
 **Expedited Forwarding (EF)**
 
-The VIP lane. Used for strict, delay-sensitive traffic like Voice over IP (VoIP). It gets low delay, low jitter, and minimal loss.
+Defined in RFC 3246, EF provides the highest forwarding priority. It guarantees low latency, low jitter, and minimal packet loss, making it the standard choice for real-time traffic such as Voice over IP (VoIP).
 
 **Assured Forwarding (AF)**
 
-The business-class lane, defined by RFC 2597. Traffic is grouped into four independently managed classes (RFC 2597 assigns no inherent ordering between them; the actual forwarding priority of each class is determined by the operator's scheduling configuration). Each class has three levels of drop precedence (Low, Medium, High). During congestion within a class, the router discards packets with higher drop precedence first, protecting the more conformant traffic. The naming convention is **AFxy**, where **x** is the class number (1–4) and **y** is the drop precedence (1 = Low, 2 = Medium, 3 = High).
+Defined by RFC 2597, AF provides differentiated forwarding with controllable drop behavior. Traffic is grouped into four independently managed classes (RFC 2597 assigns no inherent ordering between them; the actual forwarding priority of each class is determined by the operator's scheduling configuration). Each class has three levels of drop precedence (Low, Medium, High). During congestion within a class, the router discards packets with higher drop precedence first, protecting the more conformant traffic. The naming convention is **AFxy**, where **x** is the class number (1–4) and **y** is the drop precedence (1 = Low, 2 = Medium, 3 = High).
 
 | Drop Precedence | Class 1 (001) | Class 2 (010) | Class 3 (011) | Class 4 (100) |
 | --------------- | ------------- | ------------- | ------------- | ------------- |
@@ -108,25 +108,23 @@ As a practical reference, Cisco's QoS Baseline maps common application types to 
 
 ### DiffServ Domains
 
-DiffServ does not operate as a single, global set of rules across the entire Internet. Instead, it is organized into Domains. A Domain is a distinct region of a network owned and managed by a single administrative entity. Examples include a specific Internet Service Provider (ISP) network, a corporate enterprise Wide Area Network (WAN), or a massive data center fabric. Inside a single Domain, everything is synchronized:
+DiffServ does not operate as a single, global set of rules across the entire Internet. Instead, it is organized into **Domains**. A Domain is a contiguous network region under a single administrative authority — such as an ISP backbone, a corporate WAN, or a data center fabric. Within a Domain, two properties hold:
 
-- **The Rulebook**: All routers within the Domain agree exactly on what each DSCP stamp (like Assured Forwarding or Expedited Forwarding) means and how to treat it.
+- **Consistent DSCP semantics**: Every router in the Domain interprets each DSCP codepoint identically, applying the same Per-Hop Behavior for a given stamp.
 
-- **The Border Patrol (Edge Routers)**: These sit at the outer boundaries of the Domain. They act as the gatekeepers, enforcing security and traffic policies before letting packets inside.
-
-- **The Inside Workers (Core Routers)**: These sit securely inside the Domain. Because the Edge Routers already did the checking, the Core Routers simply trust the DSCP stamps and forward the traffic at maximum speed.
+- **Trust boundary at the edge**: The Edge Routers (described above) enforce classification and policing at the Domain boundary. Core Routers inside the Domain trust the DSCP stamps applied at the edge and forward without re-inspection.
 
 
 ### Service Level Agreements (SLAs)
 
-Because the Internet is made up of thousands of different interconnected Domains, traffic eventually has to cross borders for example, when a corporate enterprise network connects to an external ISP. When two different Domains connect (peer), they negotiate a **Service Level Agreement (SLA)**.
+Because the Internet is made up of thousands of different interconnected Domains, traffic eventually has to cross borders — for example, when a corporate enterprise network connects to an external ISP. When two different Domains connect (peer), they negotiate a **Service Level Agreement (SLA)**.
 
 Think of the SLA as a strict border contract. It specifies exactly how much traffic and what classes of traffic (e.g., 50 Mbps of voice traffic, 500 Mbps of bulk data) the customer domain is legally allowed to inject into the provider domain. If the customer sends more traffic than the SLA allows, the receiving Edge Router will either drop the excess packets or downgrade their priority.
 
 
 ### The Bandwidth Broker (BB)
 
-With Domains established and SLAs negotiated, large networks need a way to manage these agreements dynamically. This is where the **Bandwidth Broker (BB)** comes in. The Bandwidth Broker is a centralized software controller responsible for managing the resources of an entire Domain. BB performs the following duties:
+With Domains established and SLAs negotiated, large networks need a way to manage these agreements dynamically. The **Bandwidth Broker (BB)** is a centralized software controller that manages the resources of an entire Domain. It performs two primary functions:
 
 - **Admission Control**: If a customer wants to send more high-priority traffic, the BB looks at the Domain's current capacity and decides whether the network can handle the new request without breaking existing SLAs with other customers.
 
@@ -134,7 +132,7 @@ With Domains established and SLAs negotiated, large networks need a way to manag
 
 <img src="../pics/domains.png" width="500"/>
 
-You might wonder: Doesn't a centralized controller sound a lot like the IntServ model that failed? The critical difference is time scale. IntServ failed because it tried to negotiate resources for every single individual connection (per-flow) in real-time. The Bandwidth Broker operates on long-term provisioning. It negotiates aggregate traffic limits for hours, days, or months at a time. By managing broad policies rather than individual packets, the architecture remains highly scalable.
+A centralized controller may appear similar to IntServ's per-flow approach, but the critical difference is time scale. IntServ failed because it tried to negotiate resources for every single individual connection (per-flow) in real-time. The Bandwidth Broker operates on long-term provisioning. It negotiates aggregate traffic limits for hours, days, or months at a time. By managing broad policies rather than individual packets, the architecture remains highly scalable.
 
 
 
@@ -142,13 +140,13 @@ You might wonder: Doesn't a centralized controller sound a lot like the IntServ 
 
 ## Switch Queuing Architecture
 
-This section covers how queues work inside a switch and why they exist. For background on the control plane and data plane, the transit path (ingress → switch fabric → egress), and traffic types (fast path vs slow path), see [Switch Architecture](https://github.com/ManiAm/net-lab-switch-setup/blob/master/docs/00_README_npu.md).
+This section covers how queues work inside a switch and why they exist. For background on the control plane and data plane, the transit path (ingress → switch fabric → egress), and traffic types (fast path vs slow path), see [Switch Architecture](https://github.com/ManiAm/net-lab-switch-serdes/blob/master/docs/01_README_npu.md).
 
 ### The Need for Queues
 
 <img src="../pics/switch-internal.png" width="500"/>
 
-In a perfect world, a packet flows instantly from Ingress, across the Fabric, and out the Egress port. However, network traffic is rarely perfectly smooth; it is highly bursty. Congestion inevitably occurs—most often due to a "many-to-one" traffic pattern, where several Ingress ports simultaneously blast traffic toward a single Egress port.
+In a perfect world, a packet flows instantly from Ingress, across the Fabric, and out the Egress port. However, network traffic is rarely perfectly smooth; it is highly bursty. Congestion inevitably occurs—most often due to a "many-to-one" traffic pattern, where multiple Ingress ports simultaneously send traffic toward a single Egress port.
 
 Because an Egress cable can only transmit (serialize onto the wire) one packet at a time, the switch cannot immediately forward the excess traffic. Instead of instantly dropping these extra packets, the switch uses Queues. A queue is a logical "waiting line" that temporarily holds packets in strict order until the hardware is ready to transmit them.
 
@@ -204,7 +202,7 @@ Packet ────►│  Classifier               │  │              │  �
             └───────────────────────────┘  └──────────────┘
 ```
 
-As described in the DiffServ section above, edge routers perform the heavy lifting — MF classification, metering, marking, and policing — while core routers skip these steps entirely, relying on the DSCP tag to place packets directly into the correct egress queue.
+On an edge router, the full pipeline executes from classification through policing. On a core router, these ingress steps are bypassed — the existing DSCP stamp determines the egress queue directly.
 
 The following sections detail each building block of the pipeline.
 
@@ -278,7 +276,7 @@ Both buckets share the single rate CIR, but they are not refilled independently.
 2. Else if $B \le T_e$ (Bucket C is short, but Bucket E has enough): spend $B$ tokens from Bucket E → **Yellow**.
 3. Else (neither bucket can cover the packet): no tokens are spent → **Red**.
 
-The srTCM answers one question: *how bursty is this flow at its contracted rate?* A flow sending at or below CIR stays Green. A flow that sends a burst exceeding CBS but still within the saved-up excess allowance (EBS) turns Yellow. A flow that exhausts both buckets turns Red. Because there is only one rate, the srTCM cannot distinguish between a flow sending at 80 Mbps versus 800 Mbps — it only cares whether the accumulated burst size fits within the bucket depths.
+The srTCM answers one question: *how bursty is this flow at its contracted rate?* A flow sending at or below CIR stays Green. A flow that sends a burst exceeding CBS but still within the saved-up excess allowance (EBS) turns Yellow. A flow that exhausts both buckets turns Red. Because there is only one rate, all traffic exceeding CIR is differentiated solely by remaining burst allowance. The srTCM cannot classify over-budget traffic into distinct rate tiers — whether a flow exceeds CIR by 10% or by 700%, the marking outcome depends only on how many tokens remain in the buckets, not on the flow's throughput relative to multiple rate thresholds.
 
 
 ### Two-Rate Three-Color Marker (trTCM)
@@ -340,9 +338,19 @@ Remarking is distinct from the Marker's internal color (which is switch-local me
 Which colors trigger which action depends on the enforcement policy. **Hard Drop** is the strict approach: Green and Yellow packets are passed, Red packets are dropped. This protects internal bandwidth but can introduce sudden packet loss and TCP reordering if the sender doesn't properly shape its bursts. **Soft Drop** is the lenient approach: Green packets are passed, Yellow and Red packets are remarked. No packets are discarded at the policer, but over-budget traffic is demoted so the network treats it as expendable downstream.
 
 
+
+## Egress Queue Structure
+
+After surviving ingress processing, packets cross the switch fabric (crossbar) and arrive at the destination egress port. Each egress port does not contain a single monolithic buffer; it is divided into multiple independent queues — up to eight, numbered TC 0 through TC 7, as defined by the IEEE 802.1Q standard. How many queues are active and how the scheduler divides link bandwidth among them is configured through **Enhanced Transmission Selection (ETS)**, covered in the next document.
+
+When a packet arrives at the egress port, the switch consults an operator-configured **DSCP-to-TC mapping table** to determine which queue the packet enters. For example, a packet marked DSCP 26 (AF31) might map to TC 3, while a packet marked DSCP 0 (Best Effort) maps to TC 0. This mapping is the bridge between DiffServ's Layer 3 classification (the DSCP stamp) and the Layer 2 queuing hardware (the physical queue index).
+
+Because each TC is an independent queue, the switch can attach per-queue traffic management policies. Each queue can have its own **Shaper** (controlling the maximum drain rate) and its own **WRED profile** (controlling when to drop or ECN-mark packets as the queue fills). The following sections describe these per-queue mechanisms.
+
+
 ## Egress Shaping (Shaper)
 
-The surviving Green and Yellow packets are routed across the switch's internal fabric and arrive at the exit port (Egress). Here, the switch uses a Shaper to ensure the traffic leaving doesn't overwhelm the downstream device. The Shaper is the network's diplomat. It uses the **Leaky Bucket** algorithm, which means it relies on memory buffers (queues).
+Each egress queue has a Shaper to ensure traffic leaving does not overwhelm the downstream device. The Shaper uses the **Leaky Bucket** algorithm, which means it relies on the queue's memory buffer to absorb bursts.
 
 If a burst of traffic arrives at the exit port faster than the outgoing cable can handle, the Shaper does not drop the packets. Instead, it holds them in its buffer and releases them gradually at the precise, configured speed limit. It prevents packet loss but introduces a slight delay (latency) while packets wait in line.
 
@@ -358,8 +366,8 @@ To prevent this, the switch uses an early warning system that takes proactive ac
 
 When a switch's egress queue starts filling up, it uses a mechanism called **Random Early Detection (RED)**. Instead of waiting for the queue to become 100% full (which causes massive, simultaneous packet loss), RED starts intentionally dropping a few random packets early. Because TCP protocols monitor for lost packets, these early drops act as a "warning shot". When the sender realizes a packet was dropped, it assumes the network is congested and slows down its transmission rate. RED monitors the average depth of the egress queue and operates with a single set of three parameters:
 
-- $K_{min}$: The queue depth where the switch starts worrying.
-- $K_{max}$: The queue depth where the switch enters panic mode.
+- $K_{min}$: The minimum threshold — the queue depth at which probabilistic action begins.
+- $K_{max}$: The maximum threshold — the queue depth at which all arriving packets are acted upon.
 - $P_{max}$: The maximum probability (percentage) of taking action between $K_{min}$ and $K_{max}$.
 
 RED treats every packet identically — it has no awareness of a packet's color or priority. It operates in three zones:
@@ -450,25 +458,33 @@ This design means that configuring "RED" versus "RED with ECN" on a switch is no
 
 ### Packet Trimming — The Third Congestion Action
 
-The sections above describe two possible actions when an egress queue is congested: **drop** the packet (RED) or **mark** it with ECN (RED with ECN). Both approaches have a fundamental limitation in high-performance environments:
+In high-performance AI and HPC fabrics, traditional congestion control mechanisms at the egress queue face fundamental limitations when buffers reach capacity:
 
-- **Dropping** destroys the packet entirely. The receiver has no immediate knowledge that the packet ever existed. Recovery depends on a retransmission timeout (RTO) at the transport layer — a delay measured in milliseconds that is catastrophic for tightly synchronized AI and HPC workloads.
+- **Dropping (RED)**: Completely destroys the packet. The receiver has no immediate knowledge of the loss, forcing the transport layer to rely on a retransmission timeout (RTO). This delay — typically tens to hundreds of milliseconds — is catastrophic for tightly synchronized workloads.
 
-- **ECN marking** preserves the packet but is a proactive, early warning signal. It operates *before* congestion becomes critical, nudging the sender to slow down. It does not help once congestion has already overwhelmed the buffer and packets must be discarded.
+- **Marking (ECN)**: Preserves the packet but acts only as a proactive, early-warning signal to slow the sender down. It offers no recovery mechanism once a queue is entirely overwhelmed and packets must be discarded.
 
-Packet Trimming introduces a third action: instead of silently discarding a packet that can no longer be buffered, the switch **truncates it** — stripping the payload and forwarding only the headers through a high-priority queue. The receiver immediately identifies the missing data from the preserved transport headers and issues a selective retransmission request (a NACK), recovering the lost data in a single round-trip rather than waiting for a timeout.
+Packet Trimming introduces a third paradigm for severe congestion. Instead of silently discarding a packet when a buffer fills, the switch truncates it. The payload is stripped, but the transport headers are preserved and forwarded. This allows the receiver to instantly identify the missing data and issue a selective retransmission request (NACK), recovering the payload in a single round-trip without waiting for an RTO.
 
 #### The Dual-DSCP Model
 
-Packet Trimming relies on a two-stage DSCP marking scheme to coordinate behavior between endpoints and the network:
+Because the end-to-end workflow depends on endpoints and intermediate switches understanding how to handle truncated packets, the system first relies on a two-stage Differentiated Services Code Point (DSCP) marking scheme:
 
-1. **DSCP-TRIMMABLE**: The source host marks outgoing data packets with a designated DSCP codepoint (e.g., DSCP 26 for RoCEv2 traffic) that identifies them as eligible for trimming. This tells every switch along the path: "If you must discard this packet due to congestion, you may trim it instead."
+- **DSCP-TRIMMABLE**: The source host tags outgoing data packets with a specific codepoint (e.g., DSCP 26 for RoCEv2). This signals to every switch in the fabric that the packet is eligible to be trimmed rather than dropped if congestion dictates a discard.
 
-2. **DSCP-TRIMMED**: When a congested switch trims a packet, it rewrites the DSCP field from the TRIMMABLE value to a different, pre-configured TRIMMED value. This rewrite serves two purposes: it tells downstream switches to classify the trimmed packet into a high-priority queue, and it tells the receiver that this packet has been trimmed and requires retransmission of the missing payload.
+- **DSCP-TRIMMED**: When a congested switch actively trims a packet, it rewrites the DSCP field from the TRIMMABLE value to a pre-configured TRIMMED value.
 
-The operator configures a mapping between each TRIMMABLE codepoint and its corresponding TRIMMED codepoint. Multiple TRIMMABLE values can map to the same TRIMMED value.
+This rewrite achieves two critical goals: it informs the destination host that the payload was intentionally removed, and it signals downstream switches to handle the packet differently.
+
+#### Priority Promotion
+
+The efficiency of the entire trimming workflow relies entirely on priority promotion.
+
+When the switch rewrites the header to the TRIMMED DSCP, it simultaneously reclassifies the packet into a higher-priority traffic class. This allows the packet to bypass the very congestion that caused it to be trimmed in the first place. Because the trimmed packet consists only of headers (typically 128–256 bytes), promoting it does not meaningfully contribute to congestion in the high-priority queue. Instead, it ensures the loss notification reaches the destination with absolute minimal delay.
 
 #### End-to-End Workflow
+
+With the Dual-DSCP model and priority promotion established, the end-to-end mechanism operates seamlessly:
 
 ```text
 Source Host                   Congested Switch                  Destination Host
@@ -494,36 +510,22 @@ Source Host                                                     │ to source   
 └────────────┘
 ```
 
-The critical detail is **priority promotion**. Because the trimmed packet is reclassified into a higher-priority traffic class, it bypasses the very congestion that caused the trimming. Since trimmed packets are extremely small (typically 128–256 bytes), promoting them does not meaningfully increase congestion — it shortens the feedback loop by ensuring the congestion signal reaches the destination with minimal delay.
+#### Switch Configuration Parameters
 
-#### Why Not Just Use ECN or PFC?
+To implement packet trimming on modern data center switch ASICs, five core parameters must be defined:
 
-Packet Trimming does not replace ECN or PFC. It complements them by addressing a scenario that neither handles well:
+- **Size**: The maximum byte length of the trimmed packet. This is typically set between 128 and 256 bytes to ensure all Layer 2, Layer 3, and Layer 4 headers — plus essential transport metadata like sequence numbers — remain intact.
 
-| Mechanism | When It Acts | What It Does | Limitation |
-| --------- | ------------ | ------------ | ---------- |
-| ECN       | Queue is filling (early warning) | Marks the packet; data is preserved | Cannot help once the buffer is actually full — if congestion exceeds the buffer, packets are still dropped |
-| PFC       | Buffer is nearly full | Pauses the upstream sender entirely | Risks head-of-line blocking; can trigger cascading PFC storms across the fabric |
-| Trimming  | Packet is about to be dropped | Truncates payload; forwards headers via high-priority queue | Payload is lost and must be retransmitted; requires transport-layer support (e.g., NACKs) |
+- **DSCP Mapping**: The specific TRIMMED codepoint that replaces the TRIMMABLE codepoint. (Administrators can map multiple TRIMMABLE values to a single TRIMMED value).
 
-In a modern AI fabric, all three mechanisms can coexist on the same link:
+- **Traffic Class (TC)**: The high-priority traffic class into which the switch reclassifies the trimmed packets to facilitate priority promotion.
 
-- **ECN** acts first, signaling senders to slow down before congestion becomes severe.
-- **PFC** acts second, pausing specific priorities to prevent buffer overflow on lossless traffic classes.
-- **Trimming** acts as the last resort when a drop is unavoidable — converting a silent loss into an explicit, fast-path signal that enables recovery in a single round-trip instead of a full RTO.
+- **Queue**: The specific egress queue assigned for forwarding the trimmed traffic. Depending on the platform, this is either hardcoded or dynamically derived from the Traffic Class.
 
-#### Configuration Parameters
+- **Direction**: The trajectory of the trimmed packet once processed:
 
-The switch exposes five core parameters for packet trimming:
+  - **notify-dst** (Standard): Forwards the trimmed headers toward the original destination. The receiver processes the loss and generates the NACK. This is the prevalent model in current deployments.
 
-- **Size**: The maximum byte length of the trimmed packet (e.g., 128, 256, or 528 bytes). This value must be large enough to preserve all Layer 2, Layer 3, and Layer 4 headers, plus any transport-specific metadata (such as sequence numbers) required for selective retransmission.
+  - **notify-src**: Sends the trimmed headers directly back to the original source, cutting the receiver out of the loop so the sender detects the loss immediately.
 
-- **DSCP**: The DSCP codepoint to stamp on trimmed packets. This value must differ from the original TRIMMABLE codepoint so that downstream switches and the receiver can distinguish a trimmed packet from normal data.
-
-- **Traffic Class (TC)**: The traffic class into which trimmed packets are reclassified. This is typically a high-priority class to ensure the trimmed headers bypass the congested queue.
-
-- **Queue**: The specific egress queue used for forwarding trimmed packets. Some platforms allow a fixed queue assignment; others dynamically select the queue based on the traffic class.
-
-- **Direction**: Determines where the trimmed packet is sent. **notify-dst** forwards the trimmed headers toward the original destination, which is the standard model — the receiver identifies the loss and issues a NACK. **notify-src** sends the trimmed headers back toward the original source, allowing the sender to detect the loss directly without waiting for the receiver's feedback. The destination-notification model is more common in current deployments.
-
-> **Note:** Packet Trimming is a key building block of the **Ultra Ethernet Transport (UET)** specification developed by the Ultra Ethernet Consortium (UEC). It is supported by modern switch ASICs including NVIDIA Spectrum-4, Broadcom Tomahawk 5, and Marvell Teralynx, and is increasingly adopted in AI and HPC data center fabrics where minimizing tail latency is critical.
+Packet Trimming is a foundational element of the Ultra Ethernet Transport (UET) specification by the Ultra Ethernet Consortium (UEC). It is actively supported by modern switch architectures — including NVIDIA Spectrum-4, Broadcom Tomahawk 5, and Marvell Teralynx — making it a critical mechanism for zero-drop, low-tail-latency AI environments.
