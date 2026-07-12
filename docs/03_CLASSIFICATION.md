@@ -55,43 +55,62 @@ Just like Fibre Channel, InfiniBand relies on a natively lossless architecture. 
 
 
 
+## Classification and the Internal Priority Pivot
 
+When a packet arrives, the switch must determine its priority. However, different types of traffic use different header fields. The IEEE 802.1Q standard uses a 3-bit Priority Code Point (PCP) for Layer 2 fabrics, while the IETF DiffServ standard uses a 6-bit Differentiated Services Code Point (DSCP) for routed IP fabrics.
 
-## The Egress Path
+Because switch pipelines require a unified value to make decisions, the first step is converting the external header into a single **Internal Priority** (traditionally a 3-bit value, from 0 to 7). The switch uses a configurable **Trust Mode** on the ingress port to determine which header to read:
 
-When a packet arrives at an egress port, the switch must determine exactly when and how to send it onto the wire. This pipeline relies on four sequential steps:
+- **Trust DSCP**: Reads the 6-bit DSCP field and maps its 64 possible values down to the 8 internal priorities. Multiple DSCP values often map to a single internal priority (e.g., standard policies map DSCP 46 to internal priority 5).
 
-- **Classification**: Deriving a single internal priority from the packet's headers.
+- **Trust PCP**: Reads the 3-bit PCP field, which typically maps 1:1 to the internal priority.
 
-- **Traffic Class Assignment**: Assigning that priority to a specific Traffic Class (TC).
+- **Trust Both**: Dynamically reads DSCP for IP traffic and PCP for non-IP traffic (such as ARP or LLDP).
 
-- **Queuing**: Placing the packet into that class's dedicated egress queue.
+Once this Internal Priority is established, it acts as the central pivot point for two parallel processes: The Ingress Path (memory allocation) and The Egress Path (scheduling).
 
-- **Scheduling**: Determining the order in which those egress queues are emptied onto the wire.
-
-No single standard governs the entire pipeline. Classification depends on the packet's layer. The 3-bit PCP field comes from the IEEE 802.1Q base standard, while the 6-bit DSCP field comes from the IETF DiffServ RFCs. Traffic Class assignment and egress scheduling are standardized by **IEEE 802.1Qaz**, commonly known as **Enhanced Transmission Selection (ETS)**. The following sections break down this pipeline, starting from how a switch reads a packet's tags to how ETS ultimately schedules the traffic.
-
-### Classification and Trust Mode
-
-When a packet arrives, the switch must decide which header field (DSCP or PCP) dictates the packet's priority. This is defined by a configurable **Trust Mode** on the ingress port:
-
-- **Trust DSCP**: The switch reads the 6-bit DSCP field. This is the standard for routed fabrics.
-- **Trust PCP**: The switch reads the 3-bit PCP field. This is standard for Layer 2 fabrics where the VLAN tag is preserved end-to-end.
-- **Trust Both**: The switch dynamically uses DSCP for IP packets and PCP for non-IP traffic (e.g., ARP, LLDP).
-
-Switch pipelines (including Priority Flow Control and egress queuing) typically operate on a 3-bit **internal priority**. If the switch trusts the 3-bit PCP, the mapping is 1:1. However, if the switch trusts the 6-bit DSCP, it must use a mapping table to compress 64 possible DSCP values down to 8 internal priority values. By design, multiple DSCP values will map to the same internal priority (for example, standard policies often map DSCP 46 to internal priority 5).
-
-```
- IP Header                  Internal Priority
-┌────────────┐             ┌────────┐
-│ DSCP (6b)  │ ──mapping──►│ 3 bits │
-└────────────┘             └────────┘
-  64 values                 8 values
+```text
+                                       ┌─► Traffic Class (TC) ──► Egress Queue & ETS Scheduling
+                                       │   (IEEE 802.1Qaz)        (Determines WHEN it leaves)
+                                       │
+Incoming Packet ──► Internal Priority ─┤
+(DSCP or PCP)                          │
+                                       │
+                                       └─► Priority Group (PG) ──► Ingress Buffer & PFC State
+                                           (IEEE 802.1Qbb)         (Determines IF it pauses)
 ```
 
-### Traffic Class Assignment
 
-Once the switch has established a single internal priority, it must logically group the packet for scheduling. This is where IEEE 802.1Qaz (ETS) begins. ETS defines the concept of the Traffic Class (TC). A Traffic Class (TC0–TC7) is a logical grouping that dictates how the traffic will be treated by the scheduler. The switch uses a configurable Priority-to-TC table to map the 3-bit internal priority to one of these logical classes.
+
+## The Ingress Path: Memory and Loss Prevention (IEEE 802.1Qbb)
+
+Before a packet can be scheduled for egress, it must be successfully buffered into the switch's memory as it arrives. The Internal Priority dictates how this memory is allocated and managed.
+
+### Priority Groups (PG)
+
+The Internal Priority maps the packet to an ingress buffer known as a **Priority Group** (PG). The PG dictates:
+
+- **Buffer Allocation**: The specific amount of memory space reserved for this traffic type.
+
+- **Lossless Behavior**: Whether flow control is enabled for this buffer. Priorities in a "lossy" PG are dropped if the buffer overflows.
+
+### Priority-based Flow Control (PFC)
+
+Standard Ethernet was historically designed to be "lossy," dropping packets when buffers overflowed. Early mitigation attempts used IEEE 802.3x PAUSE, which halted the entire physical link. In a converged network, this is unacceptable. Pausing bulk data would simultaneously halt critical, latency-sensitive traffic like VoIP.
+
+IEEE 802.1Qbb introduced Priority-based Flow Control (PFC). If a Priority Group is configured as "lossless," an impending buffer overflow will trigger a PFC PAUSE frame aimed exclusively at that specific priority. This prevents packet loss for high-volume traffic (like RDMA) while allowing best-effort traffic on the same physical cable to continue flowing.
+
+> PFC is covered in much more detail in **[Priority-based Flow Control (PFC)](04_PFC.md)**.
+
+
+
+## The Egress Path: Classification and Queuing (IEEE 802.1Qaz)
+
+Once safely buffered in a Priority Group, the switch must determine how the packet will leave the device. This process is governed by IEEE 802.1Qaz, commonly known as Enhanced Transmission Selection (ETS).
+
+### Traffic Class (TC) Assignment
+
+ETS introduces the logical concept of a **Traffic Class** (TC0–TC7). While the Priority Group dictates ingress memory, the Traffic Class dictates the egress grouping. The switch uses a Priority-to-TC table to map the Internal Priority to one of these logical classes.
 
 | Internal Priority | DSCP Example | Application Type   | Traffic Class |
 | ----------------- | ------------ | ------------------ | ------------- |
@@ -101,25 +120,19 @@ Once the switch has established a single internal priority, it must logically gr
 | 1                 | CS1 (8)      | Scavenger/Bulk     | TC1           |
 | 0                 | DF / CS0 (0) | Best Effort        | TC0 (lowest)  |
 
+### Physical Silicon Queuing
 
-### Queuing (Silicon Implementation)
-
-With the logical Traffic Class assigned, the packet must be placed into physical memory.
-
-While ETS defines the logical concept of up to 8 Traffic Classes, it does not dictate the physical queue architecture. How many physical queues actually exist on the port, how their buffers are sized, and how packets are enqueued is strictly a silicon implementation detail determined by the switch ASIC. However, the overarching rule is that packets mapped to the same TC will share the same dedicated physical egress queue.
-
-The hardware ensures that high-priority voice traffic physically sits in a different queue than best-effort background data, rather than dropping everything into one undifferentiated FIFO queue.
-
+While ETS defines up to 8 logical Traffic Classes, it does not dictate the hardware architecture. The switch ASIC determines the number and size of physical queues. However, the strict rule is isolation: packets mapped to the same TC are placed into a dedicated physical egress queue, ensuring that critical traffic is physically separated from background data.
 
 ### Egress Scheduling (Emptying the Queues)
 
-With multiple egress queues holding different classes of traffic, the switch requires a scheduler to decide which queue gets to transmit next when the port is free. This is the core of IEEE 802.1Qaz (ETS). ETS allows network operators to apply one of two scheduling algorithms to each Traffic Class:
+With multiple physical queues holding different Traffic Classes, an ETS scheduler must determine the precise order in which queues transmit data onto the wire when the port is free. Network operators typically configure a hybrid of two scheduling algorithms to balance absolute latency requirements with bandwidth fairness:
 
-- **Strict Priority (SP)**: The highest-priority queue is always drained first. As long as the SP queue has a packet waiting, no other queue is allowed to transmit. This algorithm guarantees the absolute lowest possible latency for highly critical traffic (like VoIP or RDMA Congestion Notification Packets). However, it carries the risk of starvation. If the high-priority queue is constantly full, lower-priority queues will never transmit.
+- **Strict Priority (SP)**: The scheduler drains this queue completely before allowing any other queue to transmit. It guarantees the absolute lowest latency for highly critical traffic (like VoIP or Congestion Notification Packets). The drawback is the risk of starvation; if the SP queue is constantly saturated, lower-priority queues cannot transmit.
 
-- **Deficit Weighted Round Robin (DWRR)**: Queues take turns transmitting based on a configured weight (percentage of bandwidth). DWRR tracks a "deficit counter" to account for variable packet sizes. This ensures true byte-level fairness across the queues, rather than just packet-count fairness, preventing starvation while respecting bandwidth tiers.
+- **Deficit Weighted Round Robin (DWRR)**: Queues take turns transmitting based on a configured bandwidth percentage (weight). DWRR uses a deficit counter to track variable packet sizes, ensuring true *byte-level* fairness rather than simple *packet-count* fairness. This prevents starvation while respecting bandwidth tiers.
 
-Modern switch deployments typically combine both algorithms to balance performance and fairness. Network engineers will usually assign Strict Priority to one or two queues for latency-sensitive traffic, and apply DWRR to the remaining queues to fairly divide the leftover bandwidth.
+Multiple queues can be configured as Strict Priority simultaneously; when they are, the scheduler services them in descending priority order — TC7 is fully drained before TC6, TC6 before TC5, and so on. This creates a cascading starvation hierarchy where a higher SP queue can starve a lower SP queue, and all SP queues collectively starve the DWRR queues beneath them. For this reason, SP is reserved exclusively for traffic that is both latency-critical **and** inherently low-volume.
 
 ```
 Egress Port
@@ -135,59 +148,11 @@ Scheduler
     └── TC0: Best Effort          ◄── DWRR (weight: 35%)
 ```
 
+By strictly separating ingress buffering (PGs) from egress scheduling (TCs)—both branching from the centralized Internal Priority—modern architectures seamlessly run highly sensitive, lossless flows alongside standard, lossy data on the exact same physical infrastructure. Their behaviors remain entirely isolated through distinct configurations.
+
+> For a detailed treatment of how DWRR evolved from simpler scheduling algorithms (Round Robin and Weighted Round Robin), including how the DWRR Quantum is calculated, see [Appendix A](#appendix-a-the-evolution-of-egress-scheduling-algorithms).
 
 
-
-## The Ingress Path — Preventing Loss (IEEE 802.1Qbb / PFC)
-
-While the egress path (802.1Qaz) focuses on how a switch schedules and sends traffic, the ingress path focuses on how a switch receives and buffers traffic.
-
-
-### The Problem with Standard Flow Control
-
-Standard Ethernet was originally designed to be "lossy" (it drops packets when congested and relies on upper-layer protocols like TCP to retransmit). To mitigate massive drops, early Ethernet introduced the IEEE 802.3x PAUSE mechanism.
-
-- **The Flaw (Global Pause)**: 802.3x PAUSE is a blunt instrument. It pauses the entire physical link. In a modern converged network, this is unacceptable. If a switch pauses a port to prevent dropping bulk storage data, it will simultaneously halt critical, latency-sensitive traffic like VoIP.
-
-- **The Solution (PFC)**: Priority-based Flow Control (PFC), introduced by IEEE 802.1Qbb, solves this by sending PAUSE frames that target a single priority. This allows a switch to pause high-volume, lossless traffic (like RDMA) while allowing other traffic (like best-effort data) to continue flowing over the exact same physical cable.
-
-
-### Ingress Buffers and Priority Groups (PG)
-
-Before a switch can pause a priority, it must know how to allocate memory to it. When a packet arrives, its 3-bit internal priority (derived from the DSCP or PCP tags) is mapped to an ingress buffer known as a **Priority Group** (PG). A Priority Group dictates two critical things:
-
-- **Buffer Allocation**: How much memory space is reserved for this specific group of traffic.
-
-- **Lossless Behavior**: Whether PFC is enabled or disabled for this group. Only priorities mapped to a "lossless" PG will trigger PFC PAUSE frames. Priorities in a "lossy" PG will simply be dropped if their buffer overflows.
-
-
-> PFC is covered in much more detail in **[Priority-based Flow Control (PFC)](04_PFC.md)**.
-
-
-
-
-## Putting It All Together
-
-Whether a packet arrives with a 6-bit DSCP tag or a 3-bit PCP tag, the switch’s first task is to normalize that value into a single internal priority. Although internal priority is traditionally a 3-bit value (0–7), modern ASIC architectures may employ larger internal widths to support highly granular queuing hierarchies and drop profiles. This internal priority acts as the central pivot point, simultaneously driving both the ingress and egress QoS pipelines:
-
-```text
-                                       ┌─► Traffic Class (TC) ──► Egress Queue & ETS Scheduling
-                                       │   (IEEE 802.1Qaz)        (Determines WHEN it leaves)
-                                       │
-Incoming Packet ──► Internal Priority ─┤
-(DSCP or PCP)                          │
-                                       │
-                                       └─► Priority Group (PG) ──► Ingress Buffer & PFC State
-                                           (IEEE 802.1Qbb)         (Determines IF it pauses)
-```
-
-Once the packet is assigned its internal priority, its fate is determined by two parallel processes:
-
-- **The Ingress Path** (Buffering & Flow Control): Governed by IEEE 802.1Qbb, the internal priority dictates the Priority Group (PG). The PG allocates the necessary memory buffer as the packet enters the switch and determines if the traffic is lossless. If the buffer fills, it triggers a PFC PAUSE frame upstream for this specific priority.
-
-- **The Egress Path** (Queuing & Scheduling): Governed by IEEE 802.1Qaz, the internal priority dictates the Traffic Class (TC). The TC assigns the packet to a specific physical egress queue, and the ETS scheduler (using Strict Priority or DWRR) decides exactly when that packet is serialized onto the wire.
-
-Ultimately, TCs control how traffic exits the switch (bandwidth allocation and latency guarantees), while PGs control how traffic is buffered as it enters (memory isolation and loss prevention). This dual-mapping architecture is the foundation of modern high-performance networks. It is the mechanism that enables a data center to run lossless RoCEv2 traffic (which relies on strict buffering and PFC to prevent drops) on the exact same physical infrastructure as lossy best-effort data (which relies on DWRR scheduling to fairly share leftover bandwidth). They share the same cable, but their behavior is completely isolated through distinct PGs and TCs.
 
 
 ## The DCB Toolbox: Tailoring the Pipeline to Application Needs
@@ -317,3 +282,122 @@ As data centers scaled to massive sizes, they abandoned flat Layer 2 designs in 
 Because congestion signals must now traverse routed IP fabrics, modern RoCEv2 networks replace QCN entirely with a Layer 3-aware solution: Explicit Congestion Notification (ECN) coupled with the Data Center Quantized Congestion Notification (DCQCN) algorithm. Instead of the switch generating a L2 message and sending it backward, the switch simply marks the IP header of the forward-flowing packet (ECN). When the destination server sees this mark, it generates a fully routable Layer 3 packet (a Congestion Notification Packet, or CNP) and sends it back to the source. This ensures the congestion signal can successfully navigate the routers and reach the sender.
 
 > DCQCN is covered in much more detail in **[Data Center Quantized Congestion Notification](05_DCQCN.md)**.
+
+
+
+---
+
+## Appendix A: The Evolution of Egress Scheduling Algorithms
+
+The [Egress Scheduling](#egress-scheduling-emptying-the-queues) section above describes the two scheduling modes available to ETS: Strict Priority and Deficit Weighted Round Robin (DWRR). DWRR did not emerge in isolation. It is the product of a multi-generational evolution, where each algorithm was designed to solve a specific flaw in its predecessor. This appendix traces that lineage.
+
+
+### A.1 Round Robin (RR)
+
+The simplest scheduling algorithm visits every egress queue in a continuous, sequential loop. If a queue has traffic, the scheduler pulls exactly one packet from it, transmits that packet onto the wire, and immediately advances to the next queue.
+
+**Motivation:** If a switch relies solely on strict priority scheduling, the lowest-priority queues can suffer indefinite **starvation** — they never transmit because higher-priority queues are constantly occupied. Round Robin eliminates starvation by guaranteeing that every queue eventually receives a transmission opportunity.
+
+**Strengths:**
+
+- **Zero Starvation**: Every active queue is mathematically guaranteed transmission time, regardless of how busy other queues are.
+
+- **Hardware Simplicity**: The algorithm requires minimal memory and no complex state tracking, making it trivial to implement in basic switch ASICs.
+
+**Weaknesses:**
+
+- **No QoS Differentiation**: All queues are treated identically. Critical control-plane traffic receives the exact same service rate as background storage backups, making it impossible to enforce bandwidth tiers.
+
+- **Packet Size Blindness**: RR schedules packets, not bytes. If Queue A sends 64-byte TCP ACKs and Queue B sends 1500-byte data payloads, each queue transmits one packet per round — but Queue B silently consumes approximately 23 times more bandwidth on the wire. True fairness is destroyed.
+
+To introduce QoS differentiation — allowing the scheduler to treat some queues preferentially over others — engineers extended the algorithm with configurable weights.
+
+
+### A.2 Weighted Round Robin (WRR)
+
+Weighted Round Robin retains the cyclic structure of RR but assigns each queue a configurable **weight**. Instead of pulling one packet per queue per round, the scheduler transmits *N* packets from each queue, where *N* is proportional to the queue's configured weight.
+
+**Motivation:** WRR introduces bandwidth tiers. A network operator can assign a weight of 3 to a video queue and 1 to a background data queue. For every 1 background packet transmitted, 3 video packets are transmitted.
+
+**Strengths:**
+
+- **Bandwidth Allocation**: Allows administrators to define proportional service tiers (e.g., allocating 75% of port capacity to high-priority data and 25% to low-priority traffic).
+
+- **Starvation Prevention**: Lower-priority queues still receive guaranteed, albeit smaller, portions of the transmission cycle.
+
+**Weaknesses:**
+
+- **Packet Size Blindness**: WRR still counts packets, not bytes. If the high-priority queue (weight 3) sends 64-byte frames, it transmits 3 × 64 = 192 bytes per round. If the low-priority queue (weight 1) sends 1500-byte frames, it transmits 1500 bytes per round. Despite holding a lower weight, the low-priority queue consumes approximately 88% of the actual bandwidth. Variable Maximum Transmission Units (MTUs) — ranging from tiny control frames to 9000-byte storage payloads — render WRR's bandwidth allocations unreliable.
+
+To achieve accurate bandwidth distribution in the presence of variable packet sizes, the scheduler must track the actual byte size of every packet it transmits.
+
+
+### A.3 Deficit Weighted Round Robin (DWRR)
+
+DWRR replaces the packet-counting model with a **byte-credit** system. Each queue is assigned a weight, which the switch ASIC translates into a **Quantum** — a specific number of bytes representing that queue's per-round credit allocation. Every queue also maintains a **Deficit Counter**, a running credit balance that persists across scheduling rounds.
+
+The scheduling cycle proceeds as follows:
+
+1. **Credit Allocation**: When the scheduler visits a queue, it adds the configured Quantum to that queue's Deficit Counter.
+
+2. **Transmission Decision**: The scheduler examines the exact byte size of the packet at the head of the queue.
+
+3. **Sufficient Credit**: If the Deficit Counter is greater than or equal to the packet size, the packet is transmitted. The Deficit Counter is decremented by the exact byte size of the transmitted packet. The scheduler repeats this step — transmitting additional packets from the same queue — until the queue is empty or the counter drops below the size of the next waiting packet.
+
+4. **Insufficient Credit**: If the Deficit Counter is less than the packet size, the packet remains in the queue. The remaining credit (the **deficit**) is preserved in the counter and rolls over to the next round, ensuring that no allocated bandwidth is silently lost.
+
+```text
+Queue X (Quantum = 3000 bytes)
+──────────────────────────────────────────────────────
+Round 1:
+  Deficit Counter: 0 + 3000 = 3000
+  Packet 1 (1500 B): 3000 ≥ 1500 → Transmit.  Counter: 3000 - 1500 = 1500
+  Packet 2 (1500 B): 1500 ≥ 1500 → Transmit.  Counter: 1500 - 1500 = 0
+  Packet 3 (1500 B): 0 < 1500   → Wait. Deficit of 0 saved.
+
+Round 2:
+  Deficit Counter: 0 + 3000 = 3000
+  Packet 3 (1500 B): 3000 ≥ 1500 → Transmit.  Counter: 3000 - 1500 = 1500
+  Packet 4 (800 B):  1500 ≥ 800  → Transmit.  Counter: 1500 - 800  = 700
+  Packet 5 (1500 B): 700 < 1500  → Wait. Deficit of 700 saved.
+
+Round 3:
+  Deficit Counter: 700 + 3000 = 3700
+  Packet 5 (1500 B): 3700 ≥ 1500 → Transmit.  Counter: 3700 - 1500 = 2200
+  ...
+```
+
+**Motivation:** By tracking the exact byte size of every transmission and preserving unused credits across rounds, DWRR ensures that bandwidth distribution precisely matches the configured weights over time, completely irrespective of packet sizes.
+
+**Strengths:**
+
+- **True Byte-Level Fairness**: Delivers exact bandwidth percentages. A queue sending 1500-byte packets and a queue sending 64-byte packets will ultimately receive their exact configured bandwidth ratios.
+
+- **No Wasted Bandwidth**: If a queue is empty, the scheduler immediately skips it. Its allocated bandwidth is natively redistributed among the other active queues.
+
+**Weaknesses:**
+
+- **ASIC Complexity**: The switch silicon must maintain persistent state (Deficit Counters) and perform per-packet arithmetic (subtracting variable byte lengths) for every queue at line rate. This is computationally more expensive than the simple counter logic of RR or WRR.
+
+
+### A.4 Calculating the DWRR Quantum
+
+The Quantum assigned to each queue is derived from two inputs: the queue's configured weight (expressed as a percentage of the port's total bandwidth) and the port's **Maximum Transmission Unit (MTU)**. The standard formula is:
+
+```
+Quantum = Weight (%) × MTU
+```
+
+The MTU serves as the natural scaling factor because the Quantum must be large enough to guarantee that at least one maximum-sized packet can always be transmitted per round. If the Quantum were smaller than the MTU, a queue could accumulate a deficit indefinitely without ever being able to transmit, effectively starving it.
+
+**Example:** Consider a 100 Gbps port with a 9000-byte jumbo MTU and three DWRR queues:
+
+| Queue | Application | Weight | Quantum Calculation | Quantum (Bytes) |
+| ----- | ----------- | ------ | ------------------- | --------------- |
+| TC3   | RDMA        | 50%    | 0.50 × 9000        | 4500            |
+| TC1   | Bulk Data   | 30%    | 0.30 × 9000        | 2700            |
+| TC0   | Best Effort | 20%    | 0.20 × 9000        | 1800            |
+
+Over many scheduling rounds, the cumulative bytes transmitted from each queue will converge on the 50:30:20 ratio, regardless of the individual packet sizes within each queue.
+
+> **Implementation note:** Some switch ASICs internally normalize weights or apply minimum Quantum floors to prevent edge cases where very small weights produce Quanta below common packet sizes. Vendor documentation should be consulted for platform-specific behavior.
