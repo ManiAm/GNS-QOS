@@ -16,7 +16,7 @@ Before a switch can apply any specialized rules, the packets must carry an ident
 
 ### The "Wild West" of QoS (1998–2011)
 
-Standards like 802.1Q and DiffServ defined the tags (PCP and DSCP) but failed to specify exactly how switch silicon should handle those tags at the hardware level. Because there was no standard for how queues should be scheduled or how losslessness should be guaranteed, switch vendors bolted on these behaviors in proprietary, incompatible ways. For over a decade, building a multi-vendor fabric with consistent QoS was nearly impossible.
+Standards like 802.1Q and DiffServ defined the tags (PCP and DSCP) but failed to specify exactly how switch silicon should handle those tags. Because there was no standard for how queues should be scheduled or how losslessness should be guaranteed, switch vendors bolted on these behaviors in proprietary, incompatible ways. For over a decade, building a multi-vendor fabric with consistent QoS was nearly impossible.
 
 ### The Catalyst for Convergence (FCoE)
 
@@ -32,26 +32,28 @@ To reduce cabling and hardware costs, the industry pushed to converge these two 
 
 ### The Standardization of DCB (2011)
 
-To solve the FCoE convergence problem and end the era of proprietary vendor lock-in, the IEEE crystallized a family of standards around 2011 under the umbrella of **Data Center Bridging (DCB)**. This suite provided the missing hardware instructions for Ethernet silicon. For the first time, operators could confidently run a lossless storage class alongside a lossy best-effort class on a single, standardized physical wire.
+To solve the FCoE convergence problem and end the era of proprietary vendor lock-in, the IEEE crystallized a family of standards around 2011 under the umbrella of **Data Center Bridging (DCB)**. This suite provided the missing standardized behavioral specifications for Ethernet silicon. For the first time, operators could confidently run a lossless storage class alongside a lossy best-effort class on a single, standardized physical wire.
 
 ### The Modern Rebirth (RoCEv2 and AI Fabrics)
 
-Ultimately, FCoE proved overwhelmingly complex to deploy and largely faded from the headline data center story. For a brief period, it seemed the DCB standards suite might become obsolete alongside it. However, the explosive growth of High-Performance Computing (HPC) and AI clusters brought a nearly identical problem back to the surface: InfiniBand.
+Ultimately, FCoE proved overwhelmingly complex to deploy and largely faded from mainstream adoption. For a brief period, it seemed the DCB standards suite might become obsolete alongside it. However, the explosive growth of High-Performance Computing (HPC) and AI clusters brought a nearly identical problem back to the surface: InfiniBand.
 
-Just like Fibre Channel, InfiniBand relies on a natively lossless architecture. When the industry developed RoCEv2 (RDMA over Converged Ethernet) to run InfiniBand operations over standard Ethernet, they inherited the exact same requirement: they needed to prevent packet drops at all costs. Network engineers dusted off the DCB protocols. The exact same building blocks originally invented to protect legacy storage arrays were perfectly suited to protect modern, high-speed AI workloads. Today, DCB remains the foundational QoS architecture for RDMA-based data centers.
+Just like Fibre Channel, InfiniBand relies on a natively lossless architecture. When the industry developed RoCEv2 (RDMA over Converged Ethernet) to run InfiniBand operations over standard Ethernet, they inherited the exact same requirement: they needed to prevent packet drops at all costs. Network engineers revived the DCB protocols. The exact same building blocks originally invented to protect legacy storage arrays were perfectly suited to protect modern, high-speed AI workloads. Today, DCB remains the foundational QoS architecture for RDMA-based data centers.
 
 > For an in-depth treatment of RDMA, InfiniBand, and RoCE, refer to the [RDMA Primer](https://github.com/ManiAm/RDMA-Primer).
 
 
 
-### DCB building blocks (ETS, PFC, DCBX, QCN)
+### DCB Building Blocks
 
-| Feature | IEEE Standard | Primary Mechanism | Core Function |
-| ------- | ------------- | ----------------- | ------------- |
-| Enhanced Transmission Selection (ETS) | IEEE 802.1Qaz | Schedules egress queues using strict-priority or Weighted Round-Robin policies and allocates minimum bandwidth percentages per traffic class. | **The Traffic Cop**: Ensures fair bandwidth distribution under congestion. Guarantees that massive RDMA flows cannot completely starve vital network management or control-plane traffic. |
-| Priority Flow Control (PFC) | IEEE 802.1Qbb | Enables per-priority PAUSE frames on a single Ethernet link, allowing the switch to halt one priority (e.g., RoCE on PCP 3) while others continue flowing. | **The Emergency Brake**: Physically prevents packet loss by pausing a lossless priority before its ingress buffer overflows, without stopping other traffic. |
-| Data Center Bridging Exchange (DCBX) | IEEE 802.1Qaz (Extension of 802.1AB LLDP) | A discovery and capability exchange protocol that allows directly connected devices to communicate their DCB settings. | **The Auto-Negotiator**: Prevents silent misconfigurations by ensuring both sides of the cable agree on which priorities have PFC enabled and what ETS bandwidth weights are applied. |
-| Quantized Congestion Notification (QCN) | IEEE 802.1Qau | Uses Congestion Notification Messages (CNMs) to signal the original sender to slow down its transmission rate at Layer 2. | **The Layer 2 Soft Brake**: Obsolete in modern data centers. RoCEv2 networks bypass QCN and use Layer 3 ECN and DCQCN instead, because QCN cannot route across Layer 3 IP networks. |
+The DCB suite comprises four standards. Each is detailed in the sections that follow.
+
+| Feature | IEEE Standard | Purpose |
+| ------- | ------------- | ------- |
+| Enhanced Transmission Selection (ETS) | IEEE 802.1Qaz | Defines how egress queues share port bandwidth, preventing any single traffic class from monopolizing the link. |
+| Priority Flow Control (PFC) | IEEE 802.1Qbb | Enables per-priority flow control, allowing specific traffic classes to operate losslessly while others remain lossy on the same physical link. |
+| Data Center Bridging Exchange (DCBX) | IEEE 802.1Qaz (extends 802.1AB LLDP) | Auto-negotiates DCB parameters between directly connected devices, preventing silent misconfigurations. |
+| Quantized Congestion Notification (QCN) | IEEE 802.1Qau | Provides Layer 2 congestion feedback. Obsolete in modern routed fabrics; replaced by ECN and DCQCN at Layer 3. |
 
 
 
@@ -59,7 +61,7 @@ Just like Fibre Channel, InfiniBand relies on a natively lossless architecture. 
 
 When a packet arrives, the switch must determine its priority. However, different types of traffic use different header fields. The IEEE 802.1Q standard uses a 3-bit Priority Code Point (PCP) for Layer 2 fabrics, while the IETF DiffServ standard uses a 6-bit Differentiated Services Code Point (DSCP) for routed IP fabrics.
 
-Because switch pipelines require a unified value to make decisions, the first step is converting the external header into a single **Internal Priority** (traditionally a 3-bit value, from 0 to 7). The switch uses a configurable **Trust Mode** on the ingress port to determine which header to read:
+Because switch pipelines require a unified value to make decisions, the first step is converting the external header into a single **Internal Priority** (a 3-bit value, from 0 to 7). The switch uses a configurable **Trust Mode** on the ingress port to determine which header to read:
 
 - **Trust DSCP**: Reads the 6-bit DSCP field and maps its 64 possible values down to the 8 internal priorities. Multiple DSCP values often map to a single internal priority (e.g., standard policies map DSCP 46 to internal priority 5).
 
@@ -96,7 +98,7 @@ The Internal Priority maps the packet to an ingress buffer known as a **Priority
 
 ### Priority-based Flow Control (PFC)
 
-Standard Ethernet was historically designed to be "lossy," dropping packets when buffers overflowed. Early mitigation attempts used IEEE 802.3x PAUSE, which halted the entire physical link. In a converged network, this is unacceptable. Pausing bulk data would simultaneously halt critical, latency-sensitive traffic like VoIP.
+Before PFC, the only flow control mechanism available was IEEE 802.3x PAUSE, which halted the entire physical link indiscriminately. In a converged network carrying multiple traffic classes, this is unacceptable — pausing a bulk data transfer would simultaneously halt latency-sensitive traffic like VoIP.
 
 IEEE 802.1Qbb introduced Priority-based Flow Control (PFC). If a Priority Group is configured as "lossless," an impending buffer overflow will trigger a PFC PAUSE frame aimed exclusively at that specific priority. This prevents packet loss for high-volume traffic (like RDMA) while allowing best-effort traffic on the same physical cable to continue flowing.
 
@@ -110,19 +112,34 @@ Once safely buffered in a Priority Group, the switch must determine how the pack
 
 ### Traffic Class (TC) Assignment
 
-ETS introduces the logical concept of a **Traffic Class** (TC0–TC7). While the Priority Group dictates ingress memory, the Traffic Class dictates the egress grouping. The switch uses a Priority-to-TC table to map the Internal Priority to one of these logical classes.
+ETS introduces the logical concept of a **Traffic Class** (TC0–TC7). While the Priority Group dictates ingress memory, the Traffic Class dictates the egress grouping. The switch uses a configurable Priority-to-TC table to map the Internal Priority to one of these logical classes.
 
-| Internal Priority | DSCP Example | Application Type   | Traffic Class |
-| ----------------- | ------------ | ------------------ | ------------- |
-| 5                 | EF (46)      | VoIP               | TC7 (highest) |
-| 4                 | AF41 (34)    | Interactive Video  | TC5           |
-| 2                 | AF21 (18)    | Transactional Data | TC3           |
-| 1                 | CS1 (8)      | Scavenger/Bulk     | TC1           |
-| 0                 | DF / CS0 (0) | Best Effort        | TC0 (lowest)  |
+No IEEE or IETF standard mandates which traffic belongs in which TC number. "IEEE 802.1Q Annex I" recommends traffic *types* per priority level (shown below), but the actual TC assignment is a local policy decision. Operators must ensure consistency across all switches in their fabric — the specific TC number does not matter, only that it is uniform.
+
+| Priority    | Traffic Type (802.1Q Annex I) |
+| ----------- | ----------------------------- |
+| 1 (lowest)  | Background |
+| 0 (default) | Best Effort |
+| 2           | Excellent Effort |
+| 3           | Critical Applications |
+| 4           | Video, < 100 ms latency |
+| 5           | Voice, < 10 ms latency |
+| 6           | Internetwork Control |
+| 7 (highest) | Network Control |
+
+Note the non-linear ordering — priority 1 is lower than priority 0 (default). This table maps priority values to recommended traffic types, but does not assign TC numbers.
+
+In practice, vendors and industry groups publish their own templates (not mandates):
+
+- **SONiC AZURE profile** — Microsoft's data center convention (TC 3/4 = lossless for RoCEv2)
+- **IBTA RoCEv2 Annex** — recommends DSCP 26 (AF31) for RoCEv2 data traffic
+- **Cisco / Arista defaults** — their own TC groupings for campus/DC use cases
+
+These are conventions, not requirements. Two operators can use completely different TC assignments as long as the mapping is consistent across all switches in the fabric.
 
 ### Physical Silicon Queuing
 
-While ETS defines up to 8 logical Traffic Classes, it does not dictate the hardware architecture. The switch ASIC determines the number and size of physical queues. However, the strict rule is isolation: packets mapped to the same TC are placed into a dedicated physical egress queue, ensuring that critical traffic is physically separated from background data.
+While ETS defines up to 8 logical Traffic Classes, it does not dictate the hardware architecture. The switch ASIC determines the number and size of physical queues. However, the standard requires queue isolation: packets mapped to the same TC are placed into a dedicated physical egress queue, ensuring that distinct traffic classes are physically separated from one another.
 
 ### Egress Scheduling (Emptying the Queues)
 
@@ -161,46 +178,32 @@ While the dual-mapping architecture described above makes converged networks pos
 
 Here is how different traffic profiles navigate the exact same DCB pipeline:
 
-- **The Need for Speed (Latency-Sensitive)**: Applications like real-time Voice over IP (VoIP) or routing control protocols (BGP) explicitly reject the lossless tool, PFC. For these applications, pausing a packet in a buffer ruins the real-time audio or breaks the network topology. Therefore, they map to standard lossy Priority Groups on the ingress side. If the queue fills up, the switch simply drops the packet. However, because they share the egress port with massive data flows, they must interact with the scheduling tool, ETS (802.1Qaz). They utilize ETS to secure a Strict Priority (SP) fast-lane, allowing them to instantly jump ahead of bulk data.
+- **The Need for Speed (Latency-Sensitive)**: Applications like real-time Voice over IP (VoIP) or routing control protocols (BGP) are not configured with PFC. For these applications, the buffering latency introduced by flow control would degrade real-time audio or delay routing convergence. Therefore, they map to standard lossy Priority Groups on the ingress side. If the buffer fills, the switch drops excess packets — an acceptable trade-off, since brief loss is preferable to added latency. However, because they share the egress port with high-volume data flows, they rely on the scheduling mechanism, ETS (802.1Qaz). They are placed in a Strict Priority (SP) queue, ensuring they are transmitted before bulk data.
 
-- **The Need for Perfection (Loss-Sensitive)**: Applications like RoCEv2 or traditional storage cannot tolerate dropped packets. They actively enable PFC on the ingress port to guarantee zero packet loss, creating a lossless Priority Group. On the egress port, instead of demanding a strict fast-lane (which would completely starve the rest of the switch given their massive volume), they rely on ETS configured with DWRR weights. This allows them to fairly share the remaining bandwidth percentages alongside best-effort web traffic.
+- **The Need for Perfection (Loss-Sensitive)**: Applications like RoCEv2 or iSCSI-based storage cannot tolerate dropped packets. They enable PFC on the ingress port to prevent packet loss, creating a lossless Priority Group. On the egress port, rather than using Strict Priority scheduling — which would starve other traffic classes due to their sustained high volume — they rely on ETS configured with DWRR weights. This allows them to share the remaining bandwidth proportionally with other traffic classes.
 
-The table below illustrates how various applications mix and match these tools based on their core requirements:
+The table below is a unified reference showing how each traffic type uses the full DCB pipeline. The values below represent widely adopted industry conventions, not mandated standards. The specific assignment is an operator decision — what matters is that the same mapping is applied consistently from the NIC through every switch in the fabric.
 
-| Traffic Type        | Example Protocol  | Needs PFC? (Lossless)                       | ETS Scheduling Algorithm    |
-| ------------------- | ----------------- | ------------------------------------------- | --------------------------- |
-| Standard Data       | HTTP, general TCP | NO (Let TCP handle loss)                    | DWRR                        |
-| Network Control     | BGP, OSPF, BFD    | NO (Drop, don't delay)                      | Strict Priority             |
-| Real-Time Voice     | VoIP, SIP         | NO (Drop, don't delay)                      | Strict Priority (Fast lane) |
-| Traditional Storage | iSCSI             | Optional (often YES if lossless end-to-end) | DWRR                        |
-| RDMA / AI Data      | RoCEv2, NVMe-oF   | YES (Pause, don't drop)                     | DWRR (Bandwidth share)      |
-| RDMA CNPs           | RoCEv2 CNP        | NO (Tiny, infrequent — no PFC needed)       | Strict Priority             |
+| Traffic Type           | Example Protocol           | DSCP                  | TC | PFC?                       | Scheduling           | Rationale |
+| ---------------------- | -------------------------- | --------------------- | -- | -------------------------- | -------------------- | --------- |
+| Standard Data          | HTTP, general TCP          | 0 (CS0 / DF)          | 1  | NO                         | DWRR                 | Default class; TCP retransmits handle loss |
+| Background             | Bulk transfers, backups    | 8 (CS1)               | 0  | NO                         | DWRR (lowest weight) | Scavenger class; served last under contention |
+| Traditional Storage    | iSCSI                      | 18 (AF21) or 32 (CS4) | 4  | Optional (YES if lossless) | DWRR                 | No single global DSCP standard; do not use 34 (AF41), which many vendors assign to video |
+| RDMA / AI Data         | RoCEv2, NVMe-oF            | 26 (AF31)             | 3  | YES                        | DWRR                 | Industry-standard TC and DSCP (NVIDIA, AMD, Broadcom, SONiC); high-volume so DWRR prevents starvation of other classes |
+| Real-Time Voice        | VoIP, SIP                  | 46 (EF)               | 5  | NO                         | Strict Priority      | Drop preferable to delay; universally accepted codepoint for voice |
+| Network Control + CNPs | BGP, OSPF, BFD, RoCEv2 CNP | 48 (CS6)              | 6  | NO                         | Strict Priority      | Low-volume, latency-critical; CNPs share this TC when both use DSCP 48 |
 
+> **Separating CNPs from Network Control (optional):** If the operator needs distinct treatment for CNPs and routing control packets (e.g., different drop policies), CNPs can be marked with a DSCP other than CS6 — such as EF (46) — and mapped to their own TC.
 
-### Layer 3 Marking (DSCP) Best Practices and Pitfalls
+> **Critical pitfall:** Never mark massive bulk RDMA flows with CS6 (DSCP 48). Doing so places multi-gigabit AI transfers in the exact same Strict Priority queue as routing keep-alives. A single sustained RDMA burst starves BGP and OSPF, collapsing the entire network topology.
 
-To translate the table above into actual network configurations, devices must tag these packets at Layer 3 using DiffServ markings. When converging massive AI flows, voice, and standard data onto a single fabric, assigning the correct DSCP codepoint is important to avoid disastrous overlaps:
-
-- **Standard Data** — **CS0 / DF (DSCP 0)**. General TCP, HTTP, and management traffic. Usually left at the default; no special marking required.
-
-- **Network Control** — **CS6 (DSCP 48)**. Routing keep-alives and topology updates (BGP, OSPF, BFD) are critical to network survival. CS6 is reserved almost exclusively for this purpose.
-
-- **Real-Time Voice** — **EF (DSCP 46)**. The universally accepted codepoint for VoIP bearer audio. EF guarantees low latency, low jitter, and minimal loss via Strict Priority scheduling.
-
-- **Traditional Storage (iSCSI)** — No single global standard. Common choices are **AF21 (DSCP 18)** or **CS4 (DSCP 32)**, depending on vendor and whether the fabric is trusted end-to-end. Do not assume **AF41 (DSCP 34)**, which in the Cisco QoS baseline is mapped to interactive video.
-
-- **RDMA Data (RoCEv2)** — **AF31 (DSCP 26)** is the most widely documented default in NVIDIA, Broadcom, and Intel RoCEv2 deployment guides. Some designs use **EF (DSCP 46)** instead; the choice depends on the vendor blueprint and whether voice shares the fabric.
-
-- **Congestion Notification Packets (CNPs)** — CNPs are tiny Layer 3 packets generated by RoCEv2 receivers to signal congestion back to senders. Because they are latency-critical control messages (not bulk data), they are typically placed in a **Strict Priority** queue. Common markings include **DSCP 48 (CS6)** or **EF (DSCP 46)**, depending on whether the operator separates CNPs from routing control or groups all low-volume SP traffic together.
-
-> **Critical pitfall:** Never mark massive bulk RDMA flows with CS6 (DSCP 48). Doing so places multi-gigabit AI transfers in the exact same Strict Priority queue as routing keep-alives. A single sustained RDMA burst can starve BGP and OSPF, collapsing the entire network topology.
 
 
 ## Data Center Bridging Exchange (DCBX) — IEEE 802.1Qaz
 
 Configuring DCB parameters such as PFC priorities, ETS weights, and application mappings manually across thousands of switch ports and server Network Interface Cards (NICs) is highly error-prone. The Data Center Bridging Exchange Protocol (DCBX) automates this process by allowing directly connected devices to dynamically discover and negotiate their QoS settings before actual data flows.
 
-Without an automated handshake, converged networks are highly vulnerable to **silent misconfigurations**. For example, if a switch is configured to expect lossless RoCEv2 traffic on Priority 3, but a server NIC is misconfigured to send it on Priority 0, the data will still flow. However, it will land in a standard, lossy queue. Under heavy load, the switch will drop those packets, causing catastrophic performance degradation without triggering any obvious configuration alarms. DCBX provides a **declared** common configuration on the link. It dramatically reduces—but does not mathematically guarantee elimination of—all misconfigurations: both endpoints must implement DCBX, the policy must be applied correctly, and operators still validate with test traffic and monitoring.
+Without an automated handshake, converged networks are highly vulnerable to **silent misconfigurations**. For example, if a switch is configured to expect lossless RoCEv2 traffic on Priority 3, but a server NIC is misconfigured to send it on Priority 0, the data will still flow. However, it will land in a standard, lossy queue. Under heavy load, the switch will drop those packets, causing catastrophic performance degradation without triggering any obvious configuration alarms. DCBX significantly reduces the risk of such misconfigurations by establishing a declared common configuration on the link. However, it does not eliminate them entirely — both endpoints must implement DCBX, the policy must be configured correctly on the authoritative switch, and operators should still validate with test traffic and monitoring.
 
 ### Phase 1: The Communication Channel (LLDP)
 
@@ -252,7 +255,7 @@ sudo mlxconfig -d /dev/mst/mt4115_pciconf0 q | grep -iE "dcbx"
         DCBX_WILLING_P1                             True(1)
 ```
 
-- **`LLDP_NB_DCBX_P1 = False`**: LLDP is not in non-blocking mode, meaning DCBX negotiation runs normally over the LLDP channel. If this were `True`, LLDP frames would be forwarded to the host instead of being consumed by the NIC firmware, disabling automatic DCBX negotiation.
+- **`LLDP_NB_DCBX_P1 = False`**: LLDP operates in its default blocking mode, meaning the NIC firmware consumes DCBX-carrying LLDP frames directly and negotiates with the switch. If this were `True`, LLDP frames would instead be forwarded to the host OS, bypassing the firmware and disabling automatic DCBX negotiation.
 
 - **`DCBX_IEEE_P1 = True`**: The NIC supports the modern IEEE 802.1Qaz DCBX standard. This is the version used in current RoCEv2 deployments and is the protocol that carries the PFC, ETS, and application mapping TLVs.
 
