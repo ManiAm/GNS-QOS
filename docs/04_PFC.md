@@ -93,21 +93,37 @@ Once the upstream sender stops, the switch continues forwarding the packets it a
 The gap between Xoff and Xon creates **hysteresis**, preventing rapid pause/resume oscillation. Without this gap, a switch hovering near the Xoff line would rapidly alternate between stop and go commands, thrashing the link.
 
 
-## Switch Buffer Architecture
+## Ingress Buffer Architecture
 
-The Xoff, Xon, and headroom thresholds govern *when* PFC fires on a given Priority Group. To understand *where* those packets sit in memory, we must examine how the switch ASIC organizes its on-chip buffer.
+Each ingress port supports up to eight Priority Groups (PG0–PG7), to which internal priorities are mapped. Each PG is configured as either lossy or lossless, and every active PG requires buffer memory to absorb arriving packets. With potentially hundreds of PGs across all ports, the ASIC must allocate its finite on-chip buffer efficiently — ensuring lossless PGs have sufficient depth to trigger PFC before overflow, while lossy PGs have enough space to absorb traffic bursts before dropping.
 
 Statically assigning a fixed, worst-case memory chunk for every PG on every port would rapidly exhaust the on-chip buffer. In practice, most ports are idle at any given microsecond while a few may be heavily congested. Fixed allocation wastes buffer on idle ports while congested ports drop packets because they hit their limits.
 
 To solve this, modern switch ASICs use a dynamic, shared buffer architecture with three memory tiers:
 
-### Tier 1: Reserved Pool
+```
+┌──────────────────────────────────────────────┐
+│              Buffer Pool                     │
+├──────────────┬───────────────┬───────────────┤
+│  Guaranteed  │    Shared     │   Headroom    │
+│  (per-PG)    │  (dynamic or  │  (lossless    │
+│              │   static)     │   PGs only)   │
+└──────────────┴───────────────┴───────────────┘
+```
+
+### Tier 1: Guaranteed (Reserved) Pool
 
 Every Priority Group receives a small, dedicated block of reserved memory that only it can use. This guaranteed allocation ensures that a PG always has a minimum place to land packets and cannot be entirely starved by congestion on other ports or priority groups.
 
-### Tier 2: Shared Pool and Dynamic Thresholds (Alpha)
+### Tier 2: Shared Pool
 
-Once a PG fills its reserved space, it begins consuming memory from a global shared buffer pool common across all ports. To prevent a single PG under heavy incast from starving the rest, the switch uses dynamic thresholds governed by a parameter called `alpha` ($\alpha$).
+Once a PG fills its reserved space, it begins consuming memory from a global shared buffer pool common across all ports. To prevent a single PG under heavy incast from starving the rest, the switch enforces a threshold that caps how much shared memory any one PG may claim. Two threshold modes are available:
+
+- **Static threshold**: A fixed byte limit. The PG can consume up to a configured number of bytes from the shared pool, regardless of how much free space is available. Simple but inflexible — idle buffer capacity cannot be reclaimed by congested ports.
+
+- **Dynamic threshold**: The limit adjusts in real time based on the remaining free buffer, governed by a parameter called `alpha` ($\alpha$). This is the dominant mode in modern deployments and is detailed below.
+
+**Dynamic Thresholds (Alpha)**
 
 Alpha determines the maximum fraction of the currently available shared buffer that a single PG may claim:
 
@@ -119,7 +135,7 @@ Because "remaining shared buffer" changes in real time as other ports consume or
 
 - **Low Alpha**: The PG is restricted to a small share. Typical for lossy traffic classes (e.g., PG0 for standard TCP) where occasional drops are acceptable.
 
-A PG grows into the shared pool until its total occupancy reaches the Xoff threshold, at which point the switch fires a PFC PAUSE frame.
+For a lossless PG, occupancy grows into the shared pool until it reaches the Xoff threshold, at which point the switch fires a PFC PAUSE frame. For a lossy PG, packets exceeding its shared limit are simply dropped — no PAUSE frame is generated.
 
 > **Naming note**: Buffer management alpha is unrelated to [DCQCN alpha](./05_DCQCN.md#measuring-congestion-severity-the-alpha-alpha-parameter), which serves as a congestion severity score in the sender's rate control algorithm. They share a Greek letter but operate in entirely different domains — one in the switch ASIC's memory controller, the other in the NIC's congestion control state machine.
 
@@ -148,7 +164,7 @@ This exponent-based representation is standard across SAI-compliant implementati
 
 ### Tier 3: Headroom Allocation
 
-The headroom sized in the previous section must be physically reserved on the ASIC. Two allocation strategies exist:
+Headroom applies exclusively to lossless Priority Groups — lossy PGs have no need for it, since they simply drop packets when their buffer limit is reached. The headroom sized in the previous section must be physically reserved on the ASIC. Two allocation strategies exist:
 
 **Dedicated Headroom (Traditional)**
 
