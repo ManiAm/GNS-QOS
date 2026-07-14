@@ -466,41 +466,38 @@ In high-performance AI and HPC fabrics, traditional congestion control mechanism
 
 Packet Trimming introduces a third paradigm for severe congestion. Instead of silently discarding a packet when a buffer fills, the switch truncates it. The payload is stripped, but the transport headers are preserved and forwarded. This allows the receiver to instantly identify the missing data and issue a selective retransmission request (NACK), recovering the payload in a single round-trip without waiting for an RTO.
 
-#### The Dual-DSCP Model
+#### Trim Eligibility
 
-Because the end-to-end workflow depends on endpoints and intermediate switches understanding how to handle truncated packets, the system first relies on a two-stage Differentiated Services Code Point (DSCP) marking scheme:
+Not all traffic should be trimmed. For example, control-plane packets, such as ARP or BGP, must never be truncated. The switch must determine which packets are eligible for trimming before applying the truncation logic. This eligibility decision varies by implementation:
 
-- **DSCP-TRIMMABLE**: The source host tags outgoing data packets with a specific codepoint (e.g., DSCP 26 for RoCEv2). This signals to every switch in the fabric that the packet is eligible to be trimmed rather than dropped if congestion dictates a discard.
+- **Queue-based eligibility**: The switch trims any packet that would otherwise be dropped from a trim-enabled egress queue. Eligibility is determined entirely by which queue the packet lands in. This is the model used in current SAI APIs and SONiC implementations.
 
-- **DSCP-TRIMMED**: When a congested switch actively trims a packet, it rewrites the DSCP field from the TRIMMABLE value to a pre-configured TRIMMED value.
+- **DSCP-based eligibility**: The source NIC marks outgoing data packets with a specific DSCP codepoint (referred to as **DSCP-TRIMMABLE** in the Ultra Ethernet specification), signaling to every switch in the fabric that this packet may be truncated under congestion. The UE specification recommends combining DSCP-based eligibility with queue congestion state — both conditions must be true for trimming to occur. This approach gives endpoints explicit control over which flows opt in to trimming.
 
-This rewrite achieves two critical goals: it informs the destination host that the payload was intentionally removed, and it signals downstream switches to handle the packet differently.
+In either model, trimming is only triggered when an eligible packet encounters actual congestion at the egress queue. A packet that is eligible but arrives at an uncongested queue is forwarded normally.
 
-#### Priority Promotion
+#### DSCP Rewrite and Priority Promotion
 
-The efficiency of the entire trimming workflow relies entirely on priority promotion.
-
-When the switch rewrites the header to the TRIMMED DSCP, it simultaneously reclassifies the packet into a higher-priority traffic class. This allows the packet to bypass the very congestion that caused it to be trimmed in the first place. Because the trimmed packet consists only of headers (typically 128–256 bytes), promoting it does not meaningfully contribute to congestion in the high-priority queue. Instead, it ensures the loss notification reaches the destination with absolute minimal delay.
+Regardless of how eligibility is determined, the switch must signal to the receiver that a packet has been trimmed. It does this by rewriting the DSCP field in the IP header to a pre-configured value known as **DSCP-TRIMMED**. This rewrite informs the destination host that the payload was intentionally removed and enables **priority promotion**: because every switch in the fabric maps the TRIMMED DSCP to a higher-priority traffic class, the trimmed packet bypasses the very congestion that caused it to be trimmed. Since the trimmed packet consists only of headers (typically 128–256 bytes), promoting it does not meaningfully contribute to congestion in the high-priority queue. Instead, it ensures the loss notification reaches the destination with minimal delay.
 
 #### End-to-End Workflow
 
-With the Dual-DSCP model and priority promotion established, the end-to-end mechanism operates seamlessly:
+With trim eligibility and priority promotion established, the end-to-end mechanism operates as follows:
 
 ```text
 Source Host                   Congested Switch                  Destination Host
 ┌───────────┐                 ┌──────────────────┐              ┌──────────────┐
-│ Sends     │─── 1500B pkt ──►│ Egress buffer    │              │              │
-│ DSCP:     │    (TRIMMABLE)  │ is full.         │              │              │
-│ TRIMMABLE │                 │                  │              │              │
-└───────────┘                 │ Instead of DROP: │              │              │
-                              │ 1. Strips payload│              │              │
-                              │ 2. Keeps headers │              │              │
-                              │    (~128-256B)   │              │              │
-                              │ 3. Rewrites DSCP │              │              │
+│ Sends     │─── 1500B pkt ──►│ Egress queue     │              │              │
+│ data      │                 │ is full.         │              │              │
+│ packet    │                 │ Packet eligible. │              │              │
+└───────────┘                 │                  │              │              │
+                              │ 1. Trim packet   │              │              │
+                              │ 2. Update IP len │              │              │
+                              │ 3. Rewrite DSCP  │              │              │
                               │    → TRIMMED     │              │              │
-                              │ 4. Places in     │──► trimmed ─►│ Sees TRIMMED │
-                              │    high-priority │    packet    │ DSCP. Headers│
-                              │    queue         │              │ intact.      │
+                              │ 4. Forward on    │──► trimmed ─►│ Sees TRIMMED │
+                              │    trim queue    │    packet    │ DSCP. Headers│
+                              │ 5. Drop original │              │ intact.      │
                               └──────────────────┘              │              │
                                                                 │ Sends NACK   │
 Source Host                                                     │ to source    │
@@ -510,22 +507,37 @@ Source Host                                                     │ to source   
 └────────────┘
 ```
 
+The five operations the congested switch performs on the packet:
+
+1. **Trim** — Create a copy of the packet truncated to a configured size (e.g., 128 bytes), preserving the Ethernet, IP, and transport headers.
+2. **Update IP fields** — Rewrite the IP total length and recalculate the IP header checksum in the trimmed copy to reflect the reduced size.
+3. **Mark DSCP** — Set the DSCP field in the trimmed copy to the configured TRIMMED value, so the receiver can distinguish it from normal data.
+4. **Forward on trim queue** — Send the trimmed copy through a separate egress queue (the "trim queue") that is not congested, ensuring delivery.
+5. **Drop the original** — Discard the original full-size packet. It is counted in the queue's standard drop statistics.
+
 #### Switch Configuration Parameters
 
-To implement packet trimming on modern data center switch ASICs, five core parameters must be defined:
+To implement packet trimming on modern data center switch ASICs, four core parameters must be defined:
 
-- **Size**: The maximum byte length of the trimmed packet. This is typically set between 128 and 256 bytes to ensure all Layer 2, Layer 3, and Layer 4 headers — plus essential transport metadata like sequence numbers — remain intact.
+- **Size**: The maximum byte length of the trimmed packet. The value must be large enough to preserve the headers the receiver needs to identify the original flow and request retransmission:
 
-- **DSCP Mapping**: The specific TRIMMED codepoint that replaces the TRIMMABLE codepoint. (Administrators can map multiple TRIMMABLE values to a single TRIMMED value).
+  | Header   | Size (bytes) |
+  |----------|--------------|
+  | Ethernet | 14           |
+  | IPv4     | 20           |
+  | IPv6     | 40           |
+  | TCP      | 20           |
+  | UDP      | 8            |
+  | RoCE BTH | 12           |
+  | **Minimum for flow ID (IPv4 + BTH)** | **~46** |
+  | **Typical configured size** | **128–256** |
+
+  The configured size is set well above the minimum to accommodate optional headers (VLAN tags, GRE/VXLAN encapsulation) and transport metadata such as sequence numbers. Networks using tunneling or encapsulation require a larger trim size to preserve the inner headers.
+
+- **DSCP Mapping**: The DSCP value written into the trimmed packet's IP header (the TRIMMED codepoint). In implementations that use DSCP-based eligibility, administrators can also configure which incoming DSCP values are eligible for trimming.
 
 - **Traffic Class (TC)**: The high-priority traffic class into which the switch reclassifies the trimmed packets to facilitate priority promotion.
 
-- **Queue**: The specific egress queue assigned for forwarding the trimmed traffic. Depending on the platform, this is either hardcoded or dynamically derived from the Traffic Class.
-
-- **Direction**: The trajectory of the trimmed packet once processed:
-
-  - **notify-dst** (Standard): Forwards the trimmed headers toward the original destination. The receiver processes the loss and generates the NACK. This is the prevalent model in current deployments.
-
-  - **notify-src**: Sends the trimmed headers directly back to the original source, cutting the receiver out of the loop so the sender detects the loss immediately.
+- **Queue**: The specific egress queue assigned for forwarding the trimmed traffic. Depending on the platform, this is either an explicit index or dynamically derived from the Traffic Class.
 
 Packet Trimming is a foundational element of the Ultra Ethernet Transport (UET) specification by the Ultra Ethernet Consortium (UEC). It is actively supported by modern switch architectures — including NVIDIA Spectrum-4, Broadcom Tomahawk 5, and Marvell Teralynx — making it a critical mechanism for zero-drop, low-tail-latency AI environments.
