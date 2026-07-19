@@ -330,7 +330,7 @@ The default configuration defines three pools:
 
 #### Inside a Buffer Pool: Three Memory Regions
 
-Each pool's memory is internally divided into three regions. These correspond to the three buffer tiers described in [Ingress Buffer Architecture](04_PFC.md#ingress-buffer-architecture):
+Each pool's memory is internally divided into three regions. These correspond to the three buffer tiers described in [Ingress Buffer Architecture](04a_BUFFER.md):
 
 1. **Guaranteed** — A small reserved allocation per Priority Group (ingress) or queue (egress), configured via the buffer profile's `size` field. Each consumer is guaranteed this memory regardless of congestion.
 
@@ -364,7 +364,7 @@ The remaining fields depend on the pool's mode:
 
 **Dynamic mode** (`ingress_lossless_pool`, `egress_lossy_pool`):
 
-- **`dynamic_th`** — An alpha exponent (integer, range −8 to 8) that controls how much of the pool's *currently available* shared space a consumer may use. The limit adjusts in real time as the pool fills and drains — a higher exponent allows more aggressive borrowing, while a lower exponent restricts the consumer to a smaller fraction. For the full alpha formula, value table, and behavioral details, see [Dynamic Thresholds](04_PFC.md#tier-2-shared-pool).
+- **`dynamic_th`** — An alpha exponent (integer, range −8 to 8) that controls how much of the pool's *currently available* shared space a consumer may use. The limit adjusts in real time as the pool fills and drains — a higher exponent allows more aggressive borrowing, while a lower exponent restricts the consumer to a smaller fraction. For the full alpha formula, value table, and behavioral details, see [Dynamic Thresholds](04a_BUFFER.md#tier-2-shared-pool).
 
 **Lossless ingress profiles** have additional fields that control PFC PAUSE behavior (see [PFC Thresholds](04_PFC.md#pfc-thresholds-managing-the-buffer) for conceptual background):
 
