@@ -84,13 +84,90 @@ In short-reach deployments, cable propagation is negligible compared to switch-i
 | 400G       | ~25 ns            | ~3 μs              | ~192 KB           |
 | 800G       | ~25 ns            | ~3 μs              | ~384 KB           |
 
-These are approximate values for short-reach (5 m) deployments. Actual headroom depends on the switch ASIC (cell size, pipeline latency, MAC/PHY delay), NIC generation, and configured safety margins. Production deployments typically reserve 1.5–2x the theoretical minimum to account for worst-case burst alignment and cell overhead. Longer cables (40 m, 300 m) require proportionally larger headroom.
+These are approximate values for short-reach (5 m) deployments. The headroom figures include the processing delay, maximum frame completion overhead, and ASIC cell-size rounding. Actual headroom depends on the switch ASIC (cell size, pipeline latency, MAC/PHY delay), NIC generation, and configured safety margins. Production deployments typically reserve 1.5–2x the theoretical minimum to account for worst-case burst alignment. Longer cables (40 m, 300 m) require proportionally larger headroom.
 
 ### The Xon Threshold
 
 Once the upstream sender stops, the switch continues forwarding the packets it already has, causing the buffer to drain. The switch does not resume transmission the moment the buffer drops one byte below Xoff. Instead, it waits for the buffer to drain to a lower watermark: the Xon threshold. At this level, the switch sends a resume signal (a PAUSE frame with a timer of zero), allowing the upstream sender to transmit again.
 
 The gap between Xoff and Xon creates **hysteresis**, preventing rapid pause/resume oscillation. Without this gap, a switch hovering near the Xoff line would rapidly alternate between stop and go commands, thrashing the link.
+
+
+## The PFC PAUSE Frame
+
+A PFC PAUSE frame is a standard Ethernet MAC Control frame — exactly 64 bytes on the wire, the minimum Ethernet frame size. It carries no IP header, no VLAN tag, and no upper-layer payload. Its sole purpose is to instruct the receiving port to stop transmitting specific traffic classes for a specified duration.
+
+### Frame Structure
+
+```
+ Byte Offset   Field                          Size     Value / Purpose
+───────────────────────────────────────────────────────────────────────
+  0            Destination MAC                 6 B     01:80:C2:00:00:01 (reserved multicast)
+  6            Source MAC                      6 B     Sender's MAC address
+ 12            EtherType                       2 B     0x8808 (MAC Control)
+ 14            Opcode                          2 B     0x0101 (PFC PAUSE)
+ 16            Priority Enable Vector          2 B     Bitmap: bit N = pause priority N
+───────────────────────────────────────────────────────────────────────
+ 18            Time[0]                         2 B     Pause duration for priority 0
+ 20            Time[1]                         2 B     Pause duration for priority 1
+ 22            Time[2]                         2 B     Pause duration for priority 2
+ 24            Time[3]                         2 B     Pause duration for priority 3
+ 26            Time[4]                         2 B     Pause duration for priority 4
+ 28            Time[5]                         2 B     Pause duration for priority 5
+ 30            Time[6]                         2 B     Pause duration for priority 6
+ 32            Time[7]                         2 B     Pause duration for priority 7
+───────────────────────────────────────────────────────────────────────
+ 34            Padding                        26 B     Zeros (fill to minimum frame size)
+ 60            FCS                             4 B     Frame Check Sequence
+───────────────────────────────────────────────────────────────────────
+               Total                          64 B
+```
+
+The **Priority Enable Vector** is a 2-byte field whose lower 8 bits form a bitmap indicating which of the eight IEEE 802.1p priorities the frame applies to (the upper 8 bits are reserved and set to zero). Each enabled priority has a corresponding **Time** field specifying how long to pause that priority, measured in pause quanta.
+
+### Pause Quanta
+
+The Time field for each priority is a 16-bit unsigned integer representing the pause duration in units of **512 bit times**. A "bit time" is the time to transmit one bit at the port's current link speed — so the real-time duration of one pause quantum depends on the link speed:
+
+$$\text{1 pause quantum} = 512 \times \frac{1}{\text{link speed (bits/sec)}}$$
+
+| Link Speed | 1 Bit Time | 1 Pause Quantum (512 bit times) | Max Quanta (0xFFFF) Duration |
+|------------|------------|---------------------------------|------------------------------|
+| 10G        | 100 ps     | 51.2 ns                         | 3.36 ms                      |
+| 25G        | 40 ps      | 20.48 ns                        | 1.34 ms                      |
+| 100G       | 10 ps      | 5.12 ns                         | 335 μs                       |
+| 200G       | 5 ps       | 2.56 ns                         | 168 μs                       |
+| 400G       | 2.5 ps     | 1.28 ns                         | 84 μs                        |
+| 800G       | 1.25 ps    | 0.64 ns                         | 42 μs                        |
+
+In production, the quanta value is always set to the maximum: **0xFFFF (65535)**. The rationale is explained under [Timer Refresh](#timer-refresh-continuous-pausing).
+
+
+## PAUSE Timing and Recovery
+
+With the threshold system and frame format established, this section describes how the hardware dynamically maintains the pause state and ultimately resumes transmission.
+
+### Timer Refresh: Continuous Pausing
+
+When the switch's ingress buffer crosses the Xoff threshold, it does not send one PAUSE frame and wait. Instead, the hardware continuously transmits PFC PAUSE frames at a regular interval (typically every few microseconds) for as long as the buffer remains above Xoff. Each frame the receiver gets **resets** its pause timer:
+
+```
+pause_expiry = now + (quanta_value × 512_bit_times)
+```
+
+The sender maintains a per-priority countdown timer. Every incoming PAUSE frame for that priority overwrites the timer with the new expiry. As long as the switch keeps sending PAUSE frames faster than the timer expires, the sender remains paused indefinitely.
+
+Using the maximum quanta (0xFFFF) provides a safety margin: even if one or two PAUSE frames are lost or delayed in the MAC pipeline, the large timer value ensures the sender does not prematurely resume and overflow the congested buffer. On a 400G link, this gives an 84 μs window — far longer than the typical refresh interval of a few microseconds.
+
+### Resuming Transmission
+
+The sender resumes when either condition occurs:
+
+1. **Timer expiry**: The switch stops sending PAUSE frames (because the buffer drained below Xon). The sender's countdown timer reaches zero and it resumes on its own.
+
+2. **Explicit resume (quanta = 0)**: The switch sends a PFC frame with Time[priority] = 0 for the relevant priority. This immediately clears the sender's timer, signaling "resume now." This is the mechanism triggered when the buffer drops below the Xon threshold.
+
+In practice, both mechanisms work together. Once the buffer drains below Xon, the switch sends a quanta-zero frame for immediate effect and simultaneously stops the periodic refresh. Even if the explicit resume frame is lost, the sender's timer will expire shortly after and resume anyway.
 
 
 ## Operational Risks of PFC
@@ -101,27 +178,27 @@ While PFC is a mandatory safety net for lossless Ethernet fabrics, it is fundame
 
 Even when functioning as designed, PFC can degrade network efficiency under heavy load due to its lack of per-flow granularity.
 
-**Unfair Bandwidth Allocation**: When a lossless PG on a receiving port gets congested, the switch sends a PFC PAUSE frame to all upstream sending ports. When congestion clears, all senders resume simultaneously. If one sending port handles multiple active flows while another handles only one, the single-flow port consistently grabs a disproportionate share of bandwidth.
+**Unfair Bandwidth Allocation**: When multiple ingress ports feed traffic into the same congested egress queue, each ingress port's lossless PG fills independently, and the switch sends a PFC PAUSE frame back on each affected ingress port. When congestion clears, all paused senders resume simultaneously. If one upstream device drives multiple flows while another drives only a single flow, the single-flow device consistently captures a disproportionate share of bandwidth because it can fully utilize its resumed allocation without internal contention.
 
 <img src="../pics/pfc-unfairness.webp" width="650"/>
 
-The Scenario (a & b): Multiple flows from different sending ports converge on a single lossless PG on the receiving port. When that PG hits Xoff, the switch broadcasts a PAUSE, halting both upstream interfaces.
+The Scenario (a & b): Multiple flows from different upstream ports converge on a single lossless egress queue. As that queue saturates, each ingress port's PG buffer fills independently, causing the switch to send PFC PAUSE back on each ingress link.
 
-The Imbalance (c & d): When the PG drains and the switch sends a resume signal, both upstream ports transmit simultaneously. Because Flow 2 and Flow 3 share a single sending port while Flow 1 has its own, Flow 1 consistently secures a larger share of bandwidth.
+The Imbalance (c & d): When the egress drains and PFC releases all senders, both upstream ports transmit simultaneously. Because Flow 2 and Flow 3 share a single upstream port while Flow 1 has its own, Flow 1 consistently secures a larger share of bandwidth.
 
-**Head-of-Line (HoL) Blocking**: Because PFC pauses an entire Priority Group, it cannot distinguish between congested and healthy flows sharing that group. If Flow A heads to a congested server and Flow B heads to a completely idle server, a PFC pause triggered by Flow A traps Flow B behind it.
+**Head-of-Line (HoL) Blocking**: Because PFC pauses an entire Priority Group on an ingress port, it cannot distinguish between congested and healthy flows sharing that group. If Flow A heads to a congested server and Flow B heads to a completely idle server, a PFC pause triggered by the congestion affecting Flow A also traps Flow B.
 
 <img src="../pics/pfc-hol.png" width="550"/>
 
-As illustrated, Flow 1 (red), Flow 2 (blue), and Flow 3 (green) share the same Priority Group. Flows 1 and 3 are destined for a downstream port that becomes congested. When the downstream switch sends a PFC back-pressure signal upstream, it pauses the entire PG. Flow 2, destined for an entirely different un-congested port, is also paused — blocked by the congested flows at the head of the line.
+As illustrated, Flow 1 (red), Flow 2 (blue), and Flow 3 (green) share the same Priority Group on the upstream switch's ingress port. Flows 1 and 3 are destined for a downstream port that becomes congested. When that congestion causes back-pressure via PFC, the entire PG is paused. Flow 2, destined for an entirely different un-congested port, is also paused — blocked by the congested flows at the head of the line.
 
 ### Catastrophic Network Failures
 
 Under exceptional congestion or hardware malfunction, PFC can trigger cascading failures that paralyze the entire fabric.
 
-**PFC Storms (Congestion Spreading)**: If a server NIC malfunctions and stops accepting data, the local switch buffer fills and sends a PAUSE frame to its upstream neighbor. That neighbor's buffer fills, pausing its neighbor in turn. This chain reaction cascades outward, flooding the network with PAUSE frames and bringing entire sections of the fabric to a standstill.
+**PFC Storms (Congestion Spreading)**: If a server NIC malfunctions or a stalled application stops draining the NIC's receive buffer, the NIC sends continuous PFC PAUSE frames to the local switch. The switch respects the pause and cannot deliver to that NIC, causing its own ingress buffers (fed by upstream sources) to fill. The switch then sends PFC PAUSE to its upstream neighbors, whose buffers fill in turn. This chain reaction cascades outward, flooding the network with PAUSE frames and bringing entire sections of the fabric to a standstill.
 
-**PFC Deadlock**: A permanent gridlock state caused by circular dependencies, typically triggered by a transient routing loop. For example: Switch B pauses Switch A, Switch A pauses Switch C, and because of the routing loop, Switch C pauses Switch B. All switches are stuck in a circular wait — traffic permanently drops to zero.
+**PFC Deadlock**: A permanent gridlock state caused by circular buffer dependencies, typically triggered by a transient routing loop. For example: Switch B pauses Switch A, Switch A pauses Switch C, and because of the routing loop, Switch C pauses Switch B. All switches are stuck in a circular wait — traffic permanently drops to zero.
 
 <img src="../pics/pfc-deadlock.png" width="250"/>
 
@@ -137,7 +214,7 @@ PFC conversations happen strictly hop-by-hop:
 - Between the server NIC and the ToR.
 - Between the ToR and the Spine.
 
-Because PFC is bidirectional at each link, the NIC → Switch direction is the typical origin of PFC storms. A malfunctioning NIC or stalled application continuously pauses the ToR, the ToR's egress queue backs up, its ingress buffers from the spine fill, and the ToR pauses the spine upstream. From the spine, back-pressure cascades down into every other leaf in the fabric.
+Because PFC is bidirectional at each link, the NIC → Switch direction is the typical origin of PFC storms. A malfunctioning NIC or stalled application continuously pauses the ToR, the ToR's egress queue toward that NIC backs up, its ingress buffers from the spine fill, and the ToR pauses the spine upstream. From the spine, back-pressure cascades down into every other leaf in the fabric.
 
 A single faulty NIC can therefore escalate into a fabric-wide outage. To prevent this, engineers must decide exactly where in the topology PFC is allowed to operate.
 
@@ -170,3 +247,18 @@ Because fabric-wide PFC carries severe risk, modern data centers never deploy it
 - **Restoration**: After a configurable recovery window (e.g., 200 ms), the Watchdog relinquishes control and re-enables normal PFC operations. If the root cause (such as an underlying routing loop) persists, the Watchdog catches the next deadlock and breaks it again.
 
 > While the Watchdog breaks storms after they occur, modern fabrics also rely on end-to-end congestion notification to prevent them from forming in the first place. This mechanism is covered in **[Data Center Quantized Congestion Notification](05_DCQCN.md)**.
+
+
+## Software-Crafted PFC Frames (Testing Only)
+
+Although production PFC is a hardware-only operation, it is technically possible to construct a valid PFC PAUSE frame in software and inject it onto the wire using tools such as [pfctest](https://github.com/archjeb/pfctest) (Python) or Scapy's `MACControlClassBasedFlowControl` layer.
+
+These software-crafted frames are used exclusively for **validation and debugging**: verifying that a switch or NIC correctly honors PFC PAUSE frames, testing Watchdog detection thresholds, or simulating storm conditions in a lab environment. A receiving device cannot distinguish a software-crafted PFC frame from a hardware-generated one — the frame format is identical on the wire — so the receiver will pause its transmit queues accordingly.
+
+Software-crafted PFC is unsuitable for production congestion control for three fundamental reasons:
+
+1. **Latency**: PFC must react within microseconds of a buffer threshold crossing. Software processing (system calls, scheduling, driver queues) adds orders of magnitude more delay, making timely intervention impossible at line rate.
+
+2. **No buffer visibility**: The operating system has no real-time access to the NIC's or ASIC's internal buffer fill levels. The hardware threshold-crossing event that must trigger a PAUSE frame is invisible to software.
+
+3. **No closed-loop recovery**: Production PFC requires continuous refresh while congested and an immediate Xon signal (quanta = 0) when the buffer drains. Software has no mechanism to monitor drain state and issue a precisely-timed resume, risking either permanent pausing or premature resumption.
