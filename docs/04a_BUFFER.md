@@ -29,7 +29,7 @@ Once a PG fills its reserved space, it begins consuming memory from a global sha
 
 - **Dynamic threshold**: The limit adjusts in real time based on the remaining free buffer, governed by a parameter called `alpha` ($\alpha$). This is the dominant mode in modern deployments and is detailed below.
 
-**Dynamic Thresholds (Alpha)**
+### Dynamic Thresholds (Alpha)
 
 Alpha determines the maximum fraction of the currently available shared buffer that a single PG may claim:
 
@@ -41,11 +41,39 @@ Because "remaining shared buffer" changes in real time as other ports consume or
 
 - **Low Alpha**: The PG is restricted to a small share. Typical for lossy traffic classes (e.g., PG0 for standard TCP) where occasional drops are acceptable.
 
-For a lossless PG, occupancy grows into the shared pool until it reaches the Xoff threshold, at which point the switch fires a PFC PAUSE frame. For a lossy PG, packets exceeding its shared limit is simply dropped — no PAUSE frame is generated.
+For a lossless PG, occupancy grows into the shared pool until it reaches the Xoff threshold, at which point the switch fires a PFC PAUSE frame. For a lossy PG, packets exceeding its shared limit are simply dropped — no PAUSE frame is generated.
 
 > **Naming note**: Buffer management alpha is unrelated to [DCQCN alpha](./05_DCQCN.md#measuring-congestion-severity-the-alpha-alpha-parameter), which serves as a congestion severity score in the sender's rate control algorithm. They share a Greek letter but operate in entirely different domains — one in the switch ASIC's memory controller, the other in the NIC's congestion control state machine.
 
-**Alpha Values and the Power-of-2 Convention**
+### Example: Dynamic Sharing in Action
+
+Consider a switch with a 100 KB shared pool and two active Priority Groups competing for it:
+
+- **PG0** (lossy, best-effort TCP): $\alpha$ = 1 (`dynamic_th` = 0)
+- **PG3** (lossless, RoCEv2): $\alpha$ = 8 (`dynamic_th` = 3)
+
+The table below tracks each PG's **admission threshold** as traffic arrives. *Free* is the shared pool space not currently consumed by any PG. The admission threshold is $\alpha \times \text{Free}$ — if a PG's current consumption is below this value, new packets are admitted; if above, they are rejected (dropped for lossy, PFC PAUSE for lossless).
+
+When $\alpha$ > 1, the formula can produce a value exceeding the physical pool size. This is expected — it simply means that PG is **not artificially restricted** and may use whatever free memory is physically available. The ASIC always enforces the hard pool-size ceiling regardless of the formula result.
+
+| Snapshot           | PG0 (KB) | PG3 (KB) | Free (KB) | PG0 Threshold ($1 \times F$) | PG3 Threshold ($8 \times F$) | Outcome |
+|--------------------|----------|----------|-----------|------------------------------|------------------------------|---------|
+| 1. Idle            | 0        | 0        | 100       | 100                          | 800 (uncapped)               | Full pool available; both PGs freely admit packets |
+| 2. PG0 incast      | 40       | 0        | 60        | 60                           | 480 (uncapped)               | PG0 absorbs a TCP burst; PG3 unaffected |
+| 3. PG3 also bursts | 40       | 50       | 10        | 10                           | 80                           | PG0 at 40 KB exceeds its 10 KB threshold — new arrivals dropped. PG3 at 50 KB is under its 80 KB threshold — still admits |
+| 4. PG0 drains      | 10       | 50       | 40        | 40                           | 320 (uncapped)               | PG0's congestion clears, frees 30 KB — both thresholds expand immediately |
+
+Key observations:
+
+- **Thresholds contract as the pool fills.** In snapshot 1, PG0's threshold equals the full pool. By snapshot 3, it has shrunk to 10 KB — even though PG0 itself did not grow. PG3's arrival consumed free space, which tightened PG0's threshold.
+
+- **A PG can be over its current threshold.** In snapshot 3, PG0 holds 40 KB but its threshold is only 10 KB. The ASIC does not retroactively evict buffered packets. Instead, PG0 simply cannot admit *new* packets until its occupancy falls below the threshold. Since PG0 is lossy, new arrivals are silently dropped.
+
+- **High-alpha PGs are throttled last.** Even under the same congestion in snapshot 3, PG3's threshold (80 KB) is still well above its consumption (50 KB), so it continues admitting packets. With $\alpha$ = 1 (same as PG0), PG3's threshold would be only 10 KB — forcing PFC far earlier than necessary.
+
+- **When congestion clears, thresholds recover instantly.** In snapshot 4, PG0's traffic drains and releases 30 KB back to the free pool. Both thresholds immediately expand, restoring capacity for future bursts. This is the core advantage of dynamic thresholds over static ones — idle buffer is always redistributed to where it is needed.
+
+### Alpha Values and the Power-of-2 Convention
 
 The alpha multiplier is not an arbitrary real number. Switch MMU hardware implements it as a power of 2, giving a discrete set of values from very restrictive (alpha < 1) to effectively unlimited (alpha >> 1). In the [SAI (Switch Abstraction Interface)](https://github.com/opencomputeproject/SAI) used by SONiC, alpha is configured through an integer exponent called `dynamic_th`:
 

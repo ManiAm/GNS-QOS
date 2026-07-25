@@ -45,54 +45,6 @@ Because PFC requires dedicated per-priority hardware queues, specific buffer poo
 | Standard consumer motherboard NICs / USB Adapters |                                         |
 
 
-## PFC Thresholds: Managing the Buffer
-
-PFC does not trigger the instant a buffer receives its first packet. Instead, it relies on a system of watermarks within the ingress buffer to balance maximum throughput against zero packet loss.
-
-<img src="../pics/xon-xoff.webp" width="700"/>
-
-### The Xoff Threshold
-
-This is the high-water mark. When the ingress buffer for a lossless Priority Group fills to this level, the switch generates and transmits a PFC PAUSE frame to the upstream sender. The Xoff threshold must be set high enough to avoid premature pausing (which wastes bandwidth) but low enough to leave sufficient headroom above it for in-flight packets.
-
-### Headroom (The Stopping Distance)
-
-When the switch hits Xoff and sends a PAUSE frame, the upstream sender does not stop instantly. The PAUSE frame takes time to travel backward across the physical cable, and the sender's NIC takes time to process the command. Meanwhile, packets continue arriving at line rate. **Headroom** is the reserved buffer space above the Xoff threshold designed to absorb these in-flight packets. If Xoff is hitting the brakes, headroom is the stopping distance.
-
-- **Undersized Headroom**: Packets arriving during the delay overflow the buffer and are dropped, defeating the purpose of a lossless fabric.
-
-- **Oversized Headroom**: Wastes valuable on-chip buffer memory that could be dynamically shared among other ports.
-
-The required headroom is a function of link speed and the total delay before the upstream sender actually stops:
-
-    headroom_bytes = line_rate × total_response_delay
-
-Line rate (bytes per second) is the dominant scaling factor — doubling the speed doubles the bytes in flight during any fixed delay. The total response delay includes:
-
-- **Cable propagation delay**: Time for the PAUSE frame to traverse the physical cable. At ~5 ns/m in copper, a 5 m cable adds ~25 ns. A 300 m fiber adds ~1.5 μs.
-
-- **Switch-internal delay**: Time for the local switch to detect the threshold crossing, generate the PAUSE frame, and serialize it through its MAC/PHY pipeline. Typically 1–2 μs depending on ASIC architecture.
-
-- **NIC response time**: Time between the upstream NIC receiving the PAUSE frame and halting transmission. Modern ConnectX-class NICs react in roughly ~1 μs.
-
-In short-reach deployments, cable propagation is negligible compared to switch-internal and NIC processing delays, so headroom scales almost linearly with port speed:
-
-| Port Speed | Cable Delay (5 m) | Switch + NIC Delay | Required Headroom |
-| ---------- | ----------------- | ------------------ | ----------------- |
-| 100G       | ~25 ns            | ~3 μs              | ~48 KB            |
-| 200G       | ~25 ns            | ~3 μs              | ~96 KB            |
-| 400G       | ~25 ns            | ~3 μs              | ~192 KB           |
-| 800G       | ~25 ns            | ~3 μs              | ~384 KB           |
-
-These are approximate values for short-reach (5 m) deployments. The headroom figures include the processing delay, maximum frame completion overhead, and ASIC cell-size rounding. Actual headroom depends on the switch ASIC (cell size, pipeline latency, MAC/PHY delay), NIC generation, and configured safety margins. Production deployments typically reserve 1.5–2x the theoretical minimum to account for worst-case burst alignment. Longer cables (40 m, 300 m) require proportionally larger headroom.
-
-### The Xon Threshold
-
-Once the upstream sender stops, the switch continues forwarding the packets it already has, causing the buffer to drain. The switch does not resume transmission the moment the buffer drops one byte below Xoff. Instead, it waits for the buffer to drain to a lower watermark: the Xon threshold. At this level, the switch sends a resume signal (a PAUSE frame with a timer of zero), allowing the upstream sender to transmit again.
-
-The gap between Xoff and Xon creates **hysteresis**, preventing rapid pause/resume oscillation. Without this gap, a switch hovering near the Xoff line would rapidly alternate between stop and go commands, thrashing the link.
-
-
 ## The PFC PAUSE Frame
 
 A PFC PAUSE frame is a standard Ethernet MAC Control frame — exactly 64 bytes on the wire, the minimum Ethernet frame size. It carries no IP header, no VLAN tag, and no upper-layer payload. Its sole purpose is to instruct the receiving port to stop transmitting specific traffic classes for a specified duration.
@@ -143,9 +95,57 @@ $$\text{1 pause quantum} = 512 \times \frac{1}{\text{link speed (bits/sec)}}$$
 In production, the quanta value is always set to the maximum: **0xFFFF (65535)**. The rationale is explained under [Timer Refresh](#timer-refresh-continuous-pausing).
 
 
+## PFC Thresholds: Managing the Buffer
+
+PFC does not trigger the instant a buffer receives its first packet. Instead, it relies on a system of watermarks within the ingress buffer to balance maximum throughput against zero packet loss.
+
+<img src="../pics/xon-xoff.webp" width="700"/>
+
+### The Xoff Threshold
+
+This is the high-water mark. When the ingress buffer for a lossless Priority Group fills to this level, the switch generates and transmits a PFC PAUSE frame to the upstream sender. The Xoff threshold must be set high enough to avoid premature pausing (which wastes bandwidth) but low enough to leave sufficient headroom above it for in-flight packets.
+
+### Headroom (The Stopping Distance)
+
+When the switch hits Xoff and sends a PAUSE frame, the upstream sender does not stop instantly. The PAUSE frame takes time to travel backward across the physical cable, and the sender's NIC takes time to process the command. Meanwhile, packets continue arriving at line rate. **Headroom** is the reserved buffer space above the Xoff threshold designed to absorb these in-flight packets. If Xoff is hitting the brakes, headroom is the stopping distance.
+
+- **Undersized Headroom**: Packets arriving during the delay overflow the buffer and are dropped, defeating the purpose of a lossless fabric.
+
+- **Oversized Headroom**: Wastes valuable on-chip buffer memory that could be dynamically shared among other ports.
+
+The required headroom is a function of link speed and the total delay before the upstream sender actually stops:
+
+    headroom_bytes = line_rate × total_response_delay
+
+Line rate (bytes per second) is the dominant scaling factor — doubling the speed doubles the bytes in flight during any fixed delay. The total response delay includes:
+
+- **Cable propagation delay**: Time for the PAUSE frame to traverse the physical cable. At ~5 ns/m in copper, a 5 m cable adds ~25 ns. A 300 m fiber adds ~1.5 μs.
+
+- **Switch-internal delay**: Time for the local switch to detect the threshold crossing, generate the PAUSE frame, and serialize it through its MAC/PHY pipeline. Typically 1–2 μs depending on ASIC architecture.
+
+- **NIC response time**: Time between the upstream NIC receiving the PAUSE frame and halting transmission. Modern ConnectX-class NICs react in roughly ~1 μs.
+
+In short-reach deployments, cable propagation is negligible compared to switch-internal and NIC processing delays, so headroom scales almost linearly with port speed:
+
+| Port Speed | Cable Delay (5 m) | Switch + NIC Delay | Required Headroom |
+| ---------- | ----------------- | ------------------ | ----------------- |
+| 100G       | ~25 ns            | ~3 μs              | ~48 KB            |
+| 200G       | ~25 ns            | ~3 μs              | ~96 KB            |
+| 400G       | ~25 ns            | ~3 μs              | ~192 KB           |
+| 800G       | ~25 ns            | ~3 μs              | ~384 KB           |
+
+These are approximate values for short-reach (5 m) deployments. The headroom figures include the processing delay, maximum frame completion overhead, and ASIC cell-size rounding. Actual headroom depends on the switch ASIC (cell size, pipeline latency, MAC/PHY delay), NIC generation, and configured safety margins. Production deployments typically reserve 1.5–2x the theoretical minimum to account for worst-case burst alignment. Longer cables (40 m, 300 m) require proportionally larger headroom.
+
+### The Xon Threshold
+
+Once the upstream sender stops, the switch continues forwarding the packets it already has, causing the buffer to drain. The switch does not resume transmission the moment the buffer drops one byte below Xoff. Instead, it waits for the buffer to drain to a lower watermark: the Xon threshold. At this level, the switch sends a resume signal (a PAUSE frame with quanta = 0), allowing the upstream sender to transmit again.
+
+The gap between Xoff and Xon creates **hysteresis**, preventing rapid pause/resume oscillation. Without this gap, a switch hovering near the Xoff line would rapidly alternate between stop and go commands, thrashing the link.
+
+
 ## PAUSE Timing and Recovery
 
-With the threshold system and frame format established, this section describes how the hardware dynamically maintains the pause state and ultimately resumes transmission.
+With the frame format and threshold system established, this section describes how the hardware dynamically maintains the pause state and ultimately resumes transmission.
 
 ### Timer Refresh: Continuous Pausing
 
@@ -178,19 +178,27 @@ While PFC is a mandatory safety net for lossless Ethernet fabrics, it is fundame
 
 Even when functioning as designed, PFC can degrade network efficiency under heavy load due to its lack of per-flow granularity.
 
-**Unfair Bandwidth Allocation**: When multiple ingress ports feed traffic into the same congested egress queue, each ingress port's lossless PG fills independently, and the switch sends a PFC PAUSE frame back on each affected ingress port. When congestion clears, all paused senders resume simultaneously. If one upstream device drives multiple flows while another drives only a single flow, the single-flow device consistently captures a disproportionate share of bandwidth because it can fully utilize its resumed allocation without internal contention.
+**Unfair Bandwidth Allocation**: In a lossy network, when a congestion point overflows, it drops packets from all flows. Each flow independently detects its own losses and reduces its rate (via TCP congestion control or similar). Over time, this per-flow feedback converges toward equal bandwidth per flow — regardless of how the flows are distributed across upstream links.
 
-<img src="../pics/pfc-unfairness.webp" width="650"/>
+PFC eliminates drops, which also eliminates this per-flow feedback. Instead, PFC pauses entire links. When multiple senders feed traffic into the same downstream ingress PG and that PG becomes congested, PFC back-pressure pauses all upstream links equally. The receiver's bandwidth is divided per-link, not per-flow — and a device carrying fewer flows captures a disproportionate share.
 
-The Scenario (a & b): Multiple flows from different upstream ports converge on a single lossless egress queue. As that queue saturates, each ingress port's PG buffer fills independently, causing the switch to send PFC PAUSE back on each ingress link.
+<img src="../pics/pfc-unfairness-new.png" width="650"/>
 
-The Imbalance (c & d): When the egress drains and PFC releases all senders, both upstream ports transmit simultaneously. Because Flow 2 and Flow 3 share a single upstream port while Flow 1 has its own, Flow 1 consistently secures a larger share of bandwidth.
+**(a)** Device A sends one flow (Flow 1, red) and Device B sends two flows (Flow 2 yellow, Flow 3 green). All three flows traverse the network (blue) and converge on the same downstream receiver's ingress queue (right), which approaches its Xoff threshold.
 
-**Head-of-Line (HoL) Blocking**: Because PFC pauses an entire Priority Group on an ingress port, it cannot distinguish between congested and healthy flows sharing that group. If Flow A heads to a congested server and Flow B heads to a completely idle server, a PFC pause triggered by the congestion affecting Flow A also traps Flow B.
+**(b)** The receiver's ingress PG crosses the Xoff threshold. The receiver sends PFC PAUSE back toward the senders. Because PFC is hop-by-hop, this back-pressure propagates through the switch: the switch's own ingress PG buffers fill, and it in turn pauses Device A and Device B on their respective links.
 
-<img src="../pics/pfc-hol.png" width="550"/>
+**(c)** The receiver's buffer drains below Xon. The resume signal propagates back through the switch, releasing both Device A and Device B simultaneously.
 
-As illustrated, Flow 1 (red), Flow 2 (blue), and Flow 3 (green) share the same Priority Group on the upstream switch's ingress port. Flows 1 and 3 are destined for a downstream port that becomes congested. When that congestion causes back-pressure via PFC, the entire PG is paused. Flow 2, destined for an entirely different un-congested port, is also paused — blocked by the congested flows at the head of the line.
+**(d)** Both devices resume at the same instant. Each link gets an equal share of the receiver's bandwidth. Device A puts its entire share toward Flow 1. Device B splits its equal share between Flow 2 and Flow 3. Result: Flow 1 captures ~1/2 of the bandwidth, while Flow 2 and Flow 3 each get ~1/4. In a lossy network with per-flow congestion control, all three flows would converge toward ~1/3 each.
+
+**Head-of-Line (HoL) Blocking**: When an ingress PG fills, the switch sends PFC PAUSE upstream, stopping all traffic entering that PG — regardless of each flow's destination. PFC cannot distinguish between individual flows sharing the same PG. If a congested flow and a healthy flow share the same ingress PG, the healthy flow is collateral damage.
+
+<img src="../pics/pfc-hol-new.png" width="650"/>
+
+Flow 1 (red) and Flow 3 (green) are both destined for the top-right device, whose ingress PG fills and crosses its Xoff threshold. That device sends PFC PAUSE back to the middle switch on both links carrying Flow 1 and Flow 3. The middle switch can no longer forward Flow 1 packets, so they pile up in its top ingress port's PG.
+
+Flow 2 (blue) shares that same ingress PG with Flow 1 on the middle switch — but Flow 2 is destined for the bottom-right device, which is completely idle. When the shared PG fills and the middle switch sends PFC PAUSE upstream, both Flow 1 and Flow 2 are paused. Flow 2 is blocked by Flow 1 at the head of the line, despite having a clear, uncongested path to its destination.
 
 ### Catastrophic Network Failures
 
@@ -214,7 +222,7 @@ PFC conversations happen strictly hop-by-hop:
 - Between the server NIC and the ToR.
 - Between the ToR and the Spine.
 
-Because PFC is bidirectional at each link, the NIC → Switch direction is the typical origin of PFC storms. A malfunctioning NIC or stalled application continuously pauses the ToR, the ToR's egress queue toward that NIC backs up, its ingress buffers from the spine fill, and the ToR pauses the spine upstream. From the spine, back-pressure cascades down into every other leaf in the fabric.
+Because PFC is bidirectional at each link, the NIC → Switch direction is the most common origin of [PFC storms](#catastrophic-network-failures). In a Leaf-Spine topology, the cascade follows a predictable path: the faulty NIC pauses the ToR, the ToR's spine-facing ingress buffers fill, the ToR pauses the spines, and back-pressure propagates down to every other leaf in the fabric.
 
 A single faulty NIC can therefore escalate into a fabric-wide outage. To prevent this, engineers must decide exactly where in the topology PFC is allowed to operate.
 
@@ -236,17 +244,63 @@ AI and High-Performance Computing (HPC) fabrics running RoCEv2 cannot tolerate p
 *Trade-off*: The risk of fabric-wide PFC storms is significantly higher, making the automated hardware failsafe described below mandatory.
 
 
+
 ## The PFC Watchdog
 
-Because fabric-wide PFC carries severe risk, modern data centers never deploy it without automated safety mechanisms. The **PFC Watchdog** is a hardware agent that acts as a circuit breaker, independently monitoring the state of every lossless Priority Group. It operates in three phases:
+Because fabric-wide deadlocks carry severe risk, modern data centers rely on automated circuit breakers. The PFC Watchdog monitors lossless queues for sustained pause states and intervenes to break back-pressure chains before they propagate across the fabric. In network silicon and SAI terminology, this mechanism is standardized into two phases: `DLD` (Deadlock Detection) and `DLR` (Deadlock Recovery).
 
-- **Detection**: If the Watchdog observes that a PG's transmit queue has been continuously paused for an abnormally long period (e.g., 100 ms), it flags a PFC storm or deadlock condition.
+### Detection (DLD)
 
-- **Action**: The Watchdog intervenes based on its configured policy. The most common action is `drop` — the switch temporarily ignores upstream PFC back-pressure, intentionally drops the stuck packets to drain the PG, and breaks the circular dependency. Alternatively, it can be configured to `alert` the operator or `forward` the traffic.
+A per-queue timer starts the moment a lossless queue enters a paused state — continuously receiving PFC PAUSE frames but unable to drain. If the queue remains paused beyond the **DLD interval** (the configured detection threshold), the Watchdog declares a PFC storm.
 
-- **Restoration**: After a configurable recovery window (e.g., 200 ms), the Watchdog relinquishes control and re-enables normal PFC operations. If the root cause (such as an underlying routing loop) persists, the Watchdog catches the next deadlock and breaks it again.
+The default DLD interval in SONiC is **200 ms**. For perspective, a single PFC PAUSE frame at maximum quanta lasts only 335 μs at 100G or 84 μs at 400G (see [Pause Quanta](#pause-quanta)). A normal congestion event resolves within a few pause/resume cycles — well under a millisecond. A queue that has been continuously paused for 200 ms has endured thousands of consecutive PAUSE frames without ever draining, a clear indication that the congestion is not transient.
+
+### Recovery (DLR)
+
+Once a storm is detected, the Watchdog executes the configured **DLR action** to break the back-pressure chain:
+
+- **`drop`** (most common): The switch disables PFC on the affected queue, drops all existing and incoming packets for that queue and its corresponding ingress Priority Group, and stops generating PAUSE frames upstream. This severs the chain and prevents the pause from propagating further.
+
+- **`forward`**: The switch ignores incoming PAUSE frames and forces transmission. This may cause drops downstream but still breaks the deadlock.
+
+- **`alert`**: The switch logs the storm and tracks counters but does **not** intervene — no packets are dropped or forwarded. This monitoring-only mode is useful for observing PFC storm frequency before committing to a mitigation action in a new deployment.
+
+After taking action, the Watchdog continues monitoring the affected queue. If no PFC PAUSE frames are received for the **DLR interval** (the configured restoration period), it re-enables PFC and resumes normal lossless operation. If the root cause persists, the Watchdog catches the subsequent storm and breaks it again.
+
+### Example: Normal Operation vs. Watchdog Intervention
+
+The following scenario illustrates a switch transmitting data to a downstream neighbor, contrasting healthy flow control against a deadlock scenario.
+
+**Normal PFC Operation**: Switch 1 transmits data to Switch 2. Switch 2 experiences brief congestion and begins sending continuous PFC PAUSE frames back to Switch 1. Switch 1 honors the pause and halts transmission for the affected priority. The DLD timer starts. Before the timer exceeds the DLD interval, Switch 2's buffer drains below Xon and it sends a resume frame (quanta = 0). Switch 1 resumes transmission and the DLD timer resets.
+
+<img src="../pics/pfc-watchdog-normal.png" width="700"/>
+
+**Deadlock Condition (DLD Triggers)**: Switch 2 experiences a severe fault and sends continuous PFC PAUSE frames. Switch 1 remains paused, and the DLD timer eventually crosses the DLD interval. The Watchdog declares a storm.
+
+**Recovery Action (DLR Executes)**: Switch 1 executes the DLR action. With `forward`, Switch 1 ignores the incoming PAUSE frames and resumes transmitting data to Switch 2 — Switch 2 may drop these packets, but the deadlock is broken. With `drop`, Switch 1 discards all traffic for the locked queue and its ingress PG, draining its buffers and releasing any upstream back-pressure. In both cases, once Switch 2 recovers and stops transmitting PAUSE frames for the DLR interval, the Watchdog re-enables normal PFC operation.
+
+<img src="../pics/pfc-watchdog-action.png" width="770"/>
+
+### Implementation: Software vs. Hardware
+
+The default SONiC implementation for PFC Watchdog is **software-driven**. The `syncd` daemon periodically polls ASIC counters (queue occupancy, PFC frame counts, pause duration) via SAI, and Lua scripts in the Counter DB evaluate whether a queue is in storm state. On detection, `orchagent` programs the mitigation action into the ASIC. Detection granularity is on the order of hundreds of milliseconds.
+
+Some ASICs support **hardware-accelerated** detection and recovery. Broadcom Tomahawk 4 and Tomahawk 5 implement PFC Deadlock Detection and Recovery (DLDR) directly in the ASIC, enabled via the SAI attribute `SAI_QUEUE_ATTR_ENABLE_PFC_DLDR`. When enabled, the ASIC itself monitors whether a queue is stuck in Xoff state using a hardware **DLD timer interval** of **1 ms** — orders of magnitude faster than software polling. On detection, the ASIC autonomously drops packets without CPU involvement. Software still configures the timers and policies, but the detection and mitigation execute entirely in hardware.
 
 > While the Watchdog breaks storms after they occur, modern fabrics also rely on end-to-end congestion notification to prevent them from forming in the first place. This mechanism is covered in **[Data Center Quantized Congestion Notification](05_DCQCN.md)**.
+
+### SAI Attributes
+
+The Switch Abstraction Interface (SAI) exposes the following attributes for configuring PFC Watchdog behavior. Software (e.g., SONiC `orchagent`) programs these attributes into the ASIC via SAI to control detection thresholds, recovery actions, and hardware acceleration.
+
+| SAI Attribute                               | Term               | Scope            | Purpose                                                                       |
+|---------------------------------------------|--------------------|------------------|-------------------------------------------------------------------------------|
+| `SAI_PORT_ATTR_PFC_TC_DLD_INTERVAL`         | DLD interval       | Per port, per TC | How long (ms) a queue must be continuously paused before the Watchdog declares a storm |
+| `SAI_PORT_ATTR_PFC_TC_DLR_INTERVAL`         | DLR interval       | Per port, per TC | How long (ms) the queue must be storm-free before the Watchdog re-enables PFC |
+| `SAI_QUEUE_ATTR_PFC_DLR_PACKET_ACTION`      | DLR action         | Per queue        | What to do with packets on the stuck queue (drop or forward). The `alert` action is SONiC-level and does not program SAI. |
+| `SAI_SWITCH_ATTR_PFC_TC_DLD_TIMER_INTERVAL` | DLD timer interval | Switch-wide      | Polling/timer granularity for detection (hardware-accelerated ASICs typically use 1 ms) |
+| `SAI_QUEUE_ATTR_ENABLE_PFC_DLDR`            | Enable DLDR        | Per queue        | Enables hardware-accelerated DLDR on ASICs that support it (e.g., Broadcom TH4/TH5) |
+
 
 
 ## Software-Crafted PFC Frames (Testing Only)

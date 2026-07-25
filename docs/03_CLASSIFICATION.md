@@ -16,7 +16,7 @@ Before a switch can apply any specialized rules, the packets must carry an ident
 
 ### The "Wild West" of QoS (1998–2011)
 
-Standards like 802.1Q and DiffServ defined the tags (PCP and DSCP) but failed to specify exactly how switch silicon should handle those tags. Because there was no standard for how queues should be scheduled or how losslessness should be guaranteed, switch vendors bolted on these behaviors in proprietary, incompatible ways. For over a decade, building a multi-vendor fabric with consistent QoS was nearly impossible.
+Standards like 802.1Q and DiffServ defined the tags (PCP and DSCP) but deliberately left unspecified how switch silicon should act on those tags. Neither standard dictated queue scheduling algorithms, buffer thresholds, or losslessness guarantees. Without these behavioral specifications, switch vendors implemented their own proprietary, mutually incompatible mechanisms. For over a decade, building a multi-vendor fabric with consistent QoS behavior was nearly impossible.
 
 ### The Catalyst for Convergence (FCoE)
 
@@ -26,7 +26,7 @@ In the late 2000s, data centers typically maintained two completely separate phy
 
 - **The SAN** (Storage Area Network): Fibre Channel (FC) networks dedicated entirely to storage. FC protocols assumed a physically flawless, lossless medium; storage arrays would severely degrade or crash if packets were dropped.
 
-To reduce cabling and hardware costs, the industry pushed to converge these two networks running both regular data and storage traffic over the exact same Ethernet switches. The flagship technology for this was **Fibre Channel over Ethernet** (FCoE). However, to make Ethernet acceptable for SAN traffic, engineers needed a standardized way to guarantee that specific storage priorities would never drop packets, while traditional TCP traffic remained lossy.
+To reduce cabling and hardware costs, the industry pushed to converge these two networks — running both regular data and storage traffic over the same Ethernet switches. The flagship convergence technology was **Fibre Channel over Ethernet** (FCoE). However, standard Ethernet provides no delivery guarantees; making it acceptable for SAN traffic required a standardized mechanism to guarantee that specific storage priorities would never drop packets, while traditional TCP traffic continued operating in its normal, lossy mode.
 
 <img src="../pics/Storage_FCoE.png" width="400"/>
 
@@ -36,9 +36,9 @@ To solve the FCoE convergence problem and end the era of proprietary vendor lock
 
 ### The Modern Rebirth (RoCEv2 and AI Fabrics)
 
-Ultimately, FCoE proved overwhelmingly complex to deploy and largely faded from mainstream adoption. For a brief period, it seemed the DCB standards suite might become obsolete alongside it. However, the explosive growth of High-Performance Computing (HPC) and AI clusters brought a nearly identical problem back to the surface: InfiniBand.
+Ultimately, FCoE proved operationally complex to deploy — requiring end-to-end lossless configuration, specialized Converged Network Adapters, and tight coordination between storage and network teams — and largely faded from mainstream adoption. For a brief period, the DCB standards suite appeared destined for obsolescence alongside it. However, the explosive growth of High-Performance Computing (HPC) and AI clusters brought a nearly identical problem back to the surface: InfiniBand.
 
-Just like Fibre Channel, InfiniBand relies on a natively lossless architecture. When the industry developed RoCEv2 (RDMA over Converged Ethernet) to run InfiniBand operations over standard Ethernet, they inherited the exact same requirement: they needed to prevent packet drops at all costs. Network engineers revived the DCB protocols. The exact same building blocks originally invented to protect legacy storage arrays were perfectly suited to protect modern, high-speed AI workloads. Today, DCB remains the foundational QoS architecture for RDMA-based data centers.
+Just like Fibre Channel, InfiniBand relies on a natively lossless link layer (credit-based flow control prevents any packet from being transmitted unless the receiver has available buffer space). When the industry developed RoCEv2 (RDMA over Converged Ethernet) to carry InfiniBand transport over standard Ethernet, it inherited the exact same requirement: the RDMA transport protocol does not retransmit dropped packets at the link layer, so the network must prevent packet loss. Network engineers revived the DCB protocols. The same building blocks originally invented to protect legacy storage arrays were directly applicable to modern, high-speed AI workloads. Today, DCB remains the foundational QoS architecture for RDMA-based data centers.
 
 > For an in-depth treatment of RDMA, InfiniBand, and RoCE, refer to the [RDMA Primer](https://github.com/ManiAm/RDMA-Primer).
 
@@ -59,9 +59,7 @@ The DCB suite comprises four standards. Each is detailed in the sections that fo
 
 ## Classification and the Internal Priority Pivot
 
-When a packet arrives, the switch must determine its priority. However, different types of traffic use different header fields. The IEEE 802.1Q standard uses a 3-bit Priority Code Point (PCP) for Layer 2 fabrics, while the IETF DiffServ standard uses a 6-bit Differentiated Services Code Point (DSCP) for routed IP fabrics.
-
-Because switch pipelines require a unified value to make decisions, the first step is converting the external header into a single **Internal Priority** (a 3-bit value, from 0 to 7). The switch uses a configurable **Trust Mode** on the ingress port to determine which header to read:
+When a packet arrives, the switch must resolve its external marking into a single unified value for internal processing. Although the ASIC parser can read both DSCP and PCP headers, all downstream pipeline stages — buffer management, flow control, queue selection — reference a single normalized index. This index is the 3-bit **Internal Priority** (0–7). The switch uses a configurable **Trust Mode** on the ingress port to determine which incoming header to read when deriving this value:
 
 - **Trust DSCP**: Reads the 6-bit DSCP field and maps its 64 possible values down to the 8 internal priorities. Multiple DSCP values often map to a single internal priority (e.g., standard policies map DSCP 46 to internal priority 5).
 
@@ -69,7 +67,7 @@ Because switch pipelines require a unified value to make decisions, the first st
 
 - **Trust Both**: Dynamically reads DSCP for IP traffic and PCP for non-IP traffic (such as ARP or LLDP).
 
-Once this Internal Priority is established, it acts as the central pivot point for two parallel processes: The Ingress Path (memory allocation) and The Egress Path (scheduling).
+Once the Internal Priority is established, it serves as the central pivot for two independent subsystems: the Ingress Path (memory allocation) and the Egress Path (scheduling).
 
 ```text
                                        ┌─► Traffic Class (TC) ──► Egress Queue & ETS Scheduling
@@ -90,11 +88,11 @@ Before a packet can be scheduled for egress, it must be successfully buffered in
 
 ### Priority Groups (PG)
 
-The Internal Priority maps the packet to an ingress buffer known as a **Priority Group** (PG). The PG dictates:
+The Internal Priority maps the packet to an ingress buffer partition known as a **Priority Group** (PG). A configurable Priority-to-PG table determines this assignment. The PG dictates two properties:
 
-- **Buffer Allocation**: The specific amount of memory space reserved for this traffic type.
+- **Buffer Allocation**: The amount of dedicated memory reserved for this traffic class. Each PG has a guaranteed headroom that absorbs in-flight packets while flow control takes effect.
 
-- **Lossless Behavior**: Whether flow control is enabled for this buffer. Priorities in a "lossy" PG are dropped if the buffer overflows.
+- **Lossless vs. Lossy Behavior**: Whether PFC (Priority-based Flow Control) is enabled for this PG. If PFC is enabled, the PG is lossless — an impending buffer overflow triggers a PAUSE frame to the upstream sender rather than dropping packets. If PFC is disabled, the PG is lossy — excess packets are tail-dropped when the buffer fills.
 
 ### Priority-based Flow Control (PFC)
 
@@ -114,38 +112,17 @@ Once safely buffered in a Priority Group, the switch must determine how the pack
 
 ETS introduces the logical concept of a **Traffic Class** (TC0–TC7). While the Priority Group dictates ingress memory, the Traffic Class dictates the egress grouping. The switch uses a configurable Priority-to-TC table to map the Internal Priority to one of these logical classes.
 
-No IEEE or IETF standard mandates which traffic belongs in which TC number. "IEEE 802.1Q Annex I" recommends traffic *types* per priority level (shown below), but the actual TC assignment is a local policy decision. Operators must ensure consistency across all switches in their fabric — the specific TC number does not matter, only that it is uniform.
-
-| Priority    | Traffic Type (802.1Q Annex I) |
-| ----------- | ----------------------------- |
-| 1 (lowest)  | Background |
-| 0 (default) | Best Effort |
-| 2           | Excellent Effort |
-| 3           | Critical Applications |
-| 4           | Video, < 100 ms latency |
-| 5           | Voice, < 10 ms latency |
-| 6           | Internetwork Control |
-| 7 (highest) | Network Control |
-
-Note the non-linear ordering — priority 1 is lower than priority 0 (default). This table maps priority values to recommended traffic types, but does not assign TC numbers.
-
-In practice, vendors and industry groups publish their own templates (not mandates):
-
-- **SONiC AZURE profile** — Microsoft's data center convention (TC 3/4 = lossless for RoCEv2)
-- **IBTA RoCEv2 Annex** — recommends DSCP 26 (AF31) for RoCEv2 data traffic
-- **Cisco / Arista defaults** — their own TC groupings for campus/DC use cases
-
-These are conventions, not requirements. Two operators can use completely different TC assignments as long as the mapping is consistent across all switches in the fabric.
+No IEEE or IETF standard mandates which traffic belongs in which TC number. TC assignment is a local policy decision; the specific number is irrelevant as long as the mapping is uniform across the fabric. In practice, vendors and industry groups publish recommended templates, such as the one in the [DCB Toolbox](#the-dcb-toolbox-tailoring-the-pipeline-to-application-needs) table below.
 
 ### Physical Silicon Queuing
 
-While ETS defines up to 8 logical Traffic Classes, it does not dictate the hardware architecture. The switch ASIC determines the number and size of physical queues. However, the standard requires queue isolation: packets mapped to the same TC are placed into a dedicated physical egress queue, ensuring that distinct traffic classes are physically separated from one another.
+While ETS defines up to 8 logical Traffic Classes, it does not dictate the hardware architecture. The switch ASIC determines the number and size of physical queues available per port. However, the standard mandates that each Traffic Class maps to its own dedicated egress queue — packets assigned to TC3 never share a queue with packets assigned to TC1. This physical separation ensures that scheduling decisions (bandwidth allocation, priority ordering) apply independently to each class without cross-contamination.
 
 ### Egress Scheduling (Emptying the Queues)
 
 With multiple physical queues holding different Traffic Classes, an ETS scheduler must determine the precise order in which queues transmit data onto the wire when the port is free. Network operators typically configure a hybrid of two scheduling algorithms to balance absolute latency requirements with bandwidth fairness:
 
-- **Strict Priority (SP)**: The scheduler drains this queue completely before allowing any other queue to transmit. It guarantees the absolute lowest latency for highly critical traffic (like VoIP or Congestion Notification Packets). The drawback is the risk of starvation; if the SP queue is constantly saturated, lower-priority queues cannot transmit.
+- **Strict Priority (SP)**: The scheduler drains this queue completely before allowing any other queue to transmit. It guarantees the lowest latency for critical traffic (like VoIP or Congestion Notification Packets). The drawback is the risk of starvation; if the SP queue is constantly saturated, lower-priority queues cannot transmit.
 
 - **Deficit Weighted Round Robin (DWRR)**: Queues take turns transmitting based on a configured bandwidth percentage (weight). DWRR uses a deficit counter to track variable packet sizes, ensuring true *byte-level* fairness rather than simple *packet-count* fairness. This prevents starvation while respecting bandwidth tiers.
 
@@ -157,15 +134,16 @@ Egress Port
     │
 Scheduler
     ▲
-    ├── TC7: VoIP / CNPs          ◄── Strict Priority (always first)
-    ├── TC6: Routing Control      ◄── Strict Priority
-    ├── TC5: Interactive Video    ◄── DWRR (weight: 30%)
-    ├── TC3: Transactional Data   ◄── DWRR (weight: 25%)
-    ├── TC1: Scavenger            ◄── DWRR (weight: 10%)
-    └── TC0: Best Effort          ◄── DWRR (weight: 35%)
+    ├── TC7: Switch CPU (LLDP, LACP)   ◄── Strict Priority (always first)
+    ├── TC6: Network Control / CNPs    ◄── Strict Priority
+    ├── TC5: Real-Time Voice (VoIP)    ◄── Strict Priority
+    ├── TC4: Traditional Storage       ◄── DWRR (weight: 15%)
+    ├── TC3: RDMA / AI Data            ◄── DWRR (weight: 40%)
+    ├── TC1: Standard Data             ◄── DWRR (weight: 30%)
+    └── TC0: Background                ◄── DWRR (weight: 15%)
 ```
 
-By strictly separating ingress buffering (PGs) from egress scheduling (TCs)—both branching from the centralized Internal Priority—modern architectures seamlessly run highly sensitive, lossless flows alongside standard, lossy data on the exact same physical infrastructure. Their behaviors remain entirely isolated through distinct configurations.
+By strictly separating ingress buffering (PGs) from egress scheduling (TCs) — both branching from the centralized Internal Priority — modern architectures seamlessly run lossless flows alongside lossy data on the exact same physical infrastructure. Each flow class operates with independent buffering and scheduling parameters, so their behaviors remain fully isolated.
 
 > For a detailed treatment of how DWRR evolved from simpler scheduling algorithms (Round Robin and Weighted Round Robin), including how the DWRR Quantum is calculated, see [Appendix A](#appendix-a-the-evolution-of-egress-scheduling-algorithms).
 
@@ -174,7 +152,7 @@ By strictly separating ingress buffering (PGs) from egress scheduling (TCs)—bo
 
 ## The DCB Toolbox: Tailoring the Pipeline to Application Needs
 
-While the dual-mapping architecture described above makes converged networks possible, it also leads to a common misconception. Because DCB is frequently marketed under the umbrella of "Lossless Ethernet," it is easy to assume it is an all-or-nothing feature that latency-sensitive traffic (like VoIP) completely bypasses. In reality, DCB is a modular toolbox. A converged network succeeds by allowing each application class to consume only the specific DCB components that serve its needs, while ignoring the rest.
+While the dual-mapping architecture described above makes converged networks possible, it also invites a common misconception. Because DCB is frequently marketed under the umbrella of "Lossless Ethernet," operators sometimes assume it is an all-or-nothing switch: either the entire link is lossless, or DCB is irrelevant. In reality, losslessness (PFC) is only one component. DCB is a modular toolbox. A converged network succeeds by allowing each application class to consume only the specific DCB components that serve its needs, while ignoring the rest.
 
 Here is how different traffic profiles navigate the exact same DCB pipeline:
 
@@ -182,16 +160,19 @@ Here is how different traffic profiles navigate the exact same DCB pipeline:
 
 - **The Need for Perfection (Loss-Sensitive)**: Applications like RoCEv2 or iSCSI-based storage cannot tolerate dropped packets. They enable PFC on the ingress port to prevent packet loss, creating a lossless Priority Group. On the egress port, rather than using Strict Priority scheduling — which would starve other traffic classes due to their sustained high volume — they rely on ETS configured with DWRR weights. This allows them to share the remaining bandwidth proportionally with other traffic classes.
 
-The table below is a unified reference showing how each traffic type uses the full DCB pipeline. The values below represent widely adopted industry conventions, not mandated standards. The specific assignment is an operator decision — what matters is that the same mapping is applied consistently from the NIC through every switch in the fabric.
+The table below is a unified reference showing how each traffic type uses the full DCB pipeline. The TC assignments and DSCP-to-TC mappings are widely adopted industry conventions, not mandated standards. The specific assignment is an operator decision — what matters is that the same mapping is applied consistently from the NIC through every switch in the fabric.
 
-| Traffic Type           | Example Protocol           | DSCP                  | TC | PFC?                       | Scheduling           | Rationale |
-| ---------------------- | -------------------------- | --------------------- | -- | -------------------------- | -------------------- | --------- |
-| Standard Data          | HTTP, general TCP          | 0 (CS0 / DF)          | 1  | NO                         | DWRR                 | Default class; TCP retransmits handle loss |
-| Background             | Bulk transfers, backups    | 8 (CS1)               | 0  | NO                         | DWRR (lowest weight) | Scavenger class; served last under contention |
-| Traditional Storage    | iSCSI                      | 18 (AF21) or 32 (CS4) | 4  | Optional (YES if lossless) | DWRR                 | No single global DSCP standard; do not use 34 (AF41), which many vendors assign to video |
-| RDMA / AI Data         | RoCEv2, NVMe-oF            | 26 (AF31)             | 3  | YES                        | DWRR                 | Industry-standard TC and DSCP (NVIDIA, AMD, Broadcom, SONiC); high-volume so DWRR prevents starvation of other classes |
-| Real-Time Voice        | VoIP, SIP                  | 46 (EF)               | 5  | NO                         | Strict Priority      | Drop preferable to delay; universally accepted codepoint for voice |
-| Network Control + CNPs | BGP, OSPF, BFD, RoCEv2 CNP | 48 (CS6)              | 6  | NO                         | Strict Priority      | Low-volume, latency-critical; CNPs share this TC when both use DSCP 48 |
+| Traffic Type           | Example Protocol           | DSCP                  | TC | Lossless?    | Scheduling           | Rationale |
+| ---------------------- | -------------------------- | --------------------- | -- | ------------ | -------------------- | --------- |
+| Background             | Bulk transfers, backups    | 8 (CS1)               | 0  | No           | DWRR (lowest weight) | Scavenger class; served last under contention |
+| Standard Data          | HTTP, general TCP, ICMP    | 0 (CS0 / DF)          | 1  | No           | DWRR                 | Default class; loss is tolerable (TCP retransmits, ICMP is best-effort) |
+| RDMA / AI Data         | RoCEv2, NVMe-oF            | 26 (AF31)             | 3  | Yes          | DWRR                 | Industry-standard TC and DSCP (NVIDIA, AMD, Broadcom, SONiC); high-volume so DWRR prevents starvation of other classes |
+| Traditional Storage    | iSCSI                      | 18 (AF21) or 32 (CS4) | 4  | Optional     | DWRR                 | No single global DSCP standard; do not use 34 (AF41), which many vendors assign to video |
+| Real-Time Voice        | VoIP, SIP                  | 46 (EF)               | 5  | No           | Strict Priority      | Drop preferable to delay; universally accepted codepoint for voice |
+| Network Control + CNPs | BGP, OSPF, BFD, RoCEv2 CNP | 48 (CS6)              | 6  | No           | Strict Priority      | Low-volume, latency-critical; CNPs share this TC when both use DSCP 48 |
+| Switch CPU (Internal)  | LLDP, LACP, STP BPDUs      | N/A                   | 7  | No           | Strict Priority      | L2 control frames with no IP header bypass DSCP classification; ASIC places them in TC 7 on egress; not operator-assignable |
+
+> **Reading the DSCP column:** The DSCP codepoints themselves are IETF-standardized, not arbitrary numbers. **Class Selectors (CS)** are backward-compatible with the legacy 3-bit IP Precedence field (CSn = n × 8). **Assured Forwarding (AF)** encodes a class and a drop precedence into a single value (AFxy = x × 8 + y × 2). **Expedited Forwarding (EF = 46)** is the dedicated codepoint for low-latency real-time traffic. For a full explanation of these families and their history, see [Per-Hop Behaviors](02_SERVICE_MODELS.md#per-hop-behaviors).
 
 > **Separating CNPs from Network Control (optional):** If the operator needs distinct treatment for CNPs and routing control packets (e.g., different drop policies), CNPs can be marked with a DSCP other than CS6 — such as EF (46) — and mapped to their own TC.
 
@@ -203,7 +184,7 @@ The table below is a unified reference showing how each traffic type uses the fu
 
 Configuring DCB parameters such as PFC priorities, ETS weights, and application mappings manually across thousands of switch ports and server Network Interface Cards (NICs) is highly error-prone. The Data Center Bridging Exchange Protocol (DCBX) automates this process by allowing directly connected devices to dynamically discover and negotiate their QoS settings before actual data flows.
 
-Without an automated handshake, converged networks are highly vulnerable to **silent misconfigurations**. For example, if a switch is configured to expect lossless RoCEv2 traffic on Priority 3, but a server NIC is misconfigured to send it on Priority 0, the data will still flow. However, it will land in a standard, lossy queue. Under heavy load, the switch will drop those packets, causing catastrophic performance degradation without triggering any obvious configuration alarms. DCBX significantly reduces the risk of such misconfigurations by establishing a declared common configuration on the link. However, it does not eliminate them entirely — both endpoints must implement DCBX, the policy must be configured correctly on the authoritative switch, and operators should still validate with test traffic and monitoring.
+Without an automated handshake, converged networks are vulnerable to **silent misconfigurations**. Consider this scenario: a switch is configured to apply PFC (lossless treatment) to Priority 3 for RoCEv2 traffic, but a server NIC is misconfigured to mark RoCEv2 packets with Priority 0. The data still flows — there is no immediate error — but it lands in a standard lossy queue that lacks PFC protection. Under heavy load, the switch tail-drops those packets, causing severe RDMA performance degradation without triggering any configuration alarms. DCBX significantly reduces this risk by establishing a declared common configuration before data flows. However, it does not eliminate misconfiguration entirely — both endpoints must implement DCBX, the policy must be correctly defined on the authoritative switch, and operators should still validate end-to-end behavior with test traffic and monitoring tools.
 
 ### Phase 1: The Communication Channel (LLDP)
 
@@ -270,7 +251,7 @@ sudo mlxconfig -d /dev/mst/mt4115_pciconf0 q | grep -iE "dcbx"
 
 Quantized Congestion Notification (QCN) was part of the original Data Center Bridging (DCB) suite. It was designed to provide direct, rate-limiting congestion control for early networks (such as initial FCoE or RoCEv1 deployments). However, due to fundamental shifts in how modern data centers are built, QCN is now largely obsolete.
 
-To understand why QCN failed, one must understand network boundaries. In a flat Layer 2 network, devices communicate using MAC addresses, and frames can flow freely. However, modern data centers are built with Layer 3 routers separating the switch tiers. Native Layer 2 frames cannot pass through a Layer 3 router; they are strictly trapped within their local broadcast domain.
+To understand why QCN failed, one must understand Layer 2 vs. Layer 3 forwarding boundaries. In a flat Layer 2 network, all devices share a single broadcast domain and communicate using MAC addresses; Ethernet frames can reach any device without passing through a router. Modern data centers, however, are built as routed IP fabrics with Layer 3 boundaries between switch tiers. A native Layer 2 frame (one that lacks an IP header) cannot cross a Layer 3 boundary — the router has no IP destination to forward it toward, so it is discarded.
 
 In early, flat Layer 2 data centers, QCN acted as a simple, direct feedback loop between the congested switch and the sender:
 
@@ -280,9 +261,9 @@ In early, flat Layer 2 data centers, QCN acted as a simple, direct feedback loop
 
 - **Direct Feedback**: The switch sends this CNM as a native Layer 2 frame directly backward to the MAC address of the offending server, instructing the server's NIC to throttle its transmission rate.
 
-As data centers scaled to massive sizes, they abandoned flat Layer 2 designs in favor of Layer 3 IP routing between every switch tier. This architectural shift immediately broke QCN. Because CNMs are strictly Layer 2 frames, they lack IP headers. If a server in Rack A sends traffic to a server in Rack B, and an intermediate switch experiences congestion, that switch attempts to send a L2 CNM back to Rack A. However, because the CNM hits a Layer 3 routing boundary, it is immediately dropped. The congestion signal never reaches the sender, rendering the protocol useless.
+As data centers scaled, they abandoned flat Layer 2 designs in favor of Layer 3 IP routing between every switch tier (the modern Clos/leaf-spine topology). This architectural shift broke QCN. Because CNMs are strictly Layer 2 frames — addressed by MAC with no IP header — they cannot be routed. If a server in Rack A sends traffic to a server in Rack B, and an intermediate spine switch experiences congestion, that switch generates a CNM addressed to Rack A's server MAC. However, the CNM hits a Layer 3 boundary at the leaf switch and is dropped. The congestion signal never reaches the sender, rendering the protocol useless in any routed fabric.
 
-Because congestion signals must now traverse routed IP fabrics, modern RoCEv2 networks replace QCN entirely with a Layer 3-aware solution: Explicit Congestion Notification (ECN) coupled with the Data Center Quantized Congestion Notification (DCQCN) algorithm. Instead of the switch generating a L2 message and sending it backward, the switch simply marks the IP header of the forward-flowing packet (ECN). When the destination server sees this mark, it generates a fully routable Layer 3 packet (a Congestion Notification Packet, or CNP) and sends it back to the source. This ensures the congestion signal can successfully navigate the routers and reach the sender.
+Because congestion signals must now traverse routed IP fabrics, modern RoCEv2 networks replace QCN entirely with a Layer 3 solution: Explicit Congestion Notification (ECN) coupled with the Data Center Quantized Congestion Notification (DCQCN) algorithm. The mechanism works as follows: when a switch detects congestion, instead of generating a backward-facing L2 frame, it sets the ECN bits in the IP header of the forward-flowing data packet. When the destination server receives this ECN-marked packet, it generates a fully routable Layer 3 Congestion Notification Packet (CNP) and sends it back to the source. Because the CNP carries a valid IP header, it can traverse any number of Layer 3 boundaries and reliably reach the original sender.
 
 > DCQCN is covered in much more detail in **[Data Center Quantized Congestion Notification](05_DCQCN.md)**.
 
@@ -305,13 +286,11 @@ The simplest scheduling algorithm visits every egress queue in a continuous, seq
 
 - **Zero Starvation**: Every active queue is mathematically guaranteed transmission time, regardless of how busy other queues are.
 
-- **Hardware Simplicity**: The algorithm requires minimal memory and no complex state tracking, making it trivial to implement in basic switch ASICs.
+- **Hardware Simplicity**: The algorithm requires minimal memory and no complex state tracking, making it trivial to implement in ASICs.
 
 **Weaknesses:**
 
 - **No QoS Differentiation**: All queues are treated identically. Critical control-plane traffic receives the exact same service rate as background storage backups, making it impossible to enforce bandwidth tiers.
-
-- **Packet Size Blindness**: RR schedules packets, not bytes. If Queue A sends 64-byte TCP ACKs and Queue B sends 1500-byte data payloads, each queue transmits one packet per round — but Queue B silently consumes approximately 23 times more bandwidth on the wire. True fairness is destroyed.
 
 To introduce QoS differentiation — allowing the scheduler to treat some queues preferentially over others — engineers extended the algorithm with configurable weights.
 
@@ -330,24 +309,43 @@ Weighted Round Robin retains the cyclic structure of RR but assigns each queue a
 
 **Weaknesses:**
 
-- **Packet Size Blindness**: WRR still counts packets, not bytes. If the high-priority queue (weight 3) sends 64-byte frames, it transmits 3 × 64 = 192 bytes per round. If the low-priority queue (weight 1) sends 1500-byte frames, it transmits 1500 bytes per round. Despite holding a lower weight, the low-priority queue consumes approximately 88% of the actual bandwidth. Variable Maximum Transmission Units (MTUs) — ranging from tiny control frames to 9000-byte storage payloads — render WRR's bandwidth allocations unreliable.
+- **Packet Size Blindness**: WRR (like RR) counts packets, not bytes. If the high-priority queue (weight 3) sends 64-byte frames, it transmits 3 × 64 = 192 bytes per round. If the low-priority queue (weight 1) sends 1500-byte frames, it transmits 1500 bytes per round. Despite holding a lower weight, the low-priority queue consumes approximately 88% of the actual bandwidth. True fairness is destroyed.
 
 To achieve accurate bandwidth distribution in the presence of variable packet sizes, the scheduler must track the actual byte size of every packet it transmits.
 
 
 ### A.3 Deficit Weighted Round Robin (DWRR)
 
-DWRR replaces the packet-counting model with a **byte-credit** system. Each queue is assigned a weight, which the switch ASIC translates into a **Quantum** — a specific number of bytes representing that queue's per-round credit allocation. Every queue also maintains a **Deficit Counter**, a running credit balance that persists across scheduling rounds.
+DWRR replaces the packet-counting model with a **byte-credit** system. Each queue is assigned a **Quantum** — a number of bytes representing its per-round credit allocation — and maintains a **Deficit Counter**, a running credit balance that persists across scheduling rounds.
 
 The scheduling cycle proceeds as follows:
 
-1. **Credit Allocation**: When the scheduler visits a queue, it adds the configured Quantum to that queue's Deficit Counter.
+1. **Credit Allocation**: When the scheduler visits a queue, it adds the queue's Quantum to its Deficit Counter.
 
 2. **Transmission Decision**: The scheduler examines the exact byte size of the packet at the head of the queue.
 
 3. **Sufficient Credit**: If the Deficit Counter is greater than or equal to the packet size, the packet is transmitted. The Deficit Counter is decremented by the exact byte size of the transmitted packet. The scheduler repeats this step — transmitting additional packets from the same queue — until the queue is empty or the counter drops below the size of the next waiting packet.
 
 4. **Insufficient Credit**: If the Deficit Counter is less than the packet size, the packet remains in the queue. The remaining credit (the **deficit**) is preserved in the counter and rolls over to the next round, ensuring that no allocated bandwidth is silently lost.
+
+**Motivation:** By tracking the exact byte size of every transmission and preserving unused credits across rounds, DWRR ensures that bandwidth distribution precisely matches the configured weight ratios over time, completely irrespective of packet sizes.
+
+**Strengths:**
+
+- **True Byte-Level Fairness**: Delivers exact bandwidth percentages. A queue sending 1500-byte packets and a queue sending 64-byte packets will ultimately receive their exact configured bandwidth ratios.
+
+- **No Wasted Bandwidth**: If a queue is empty, the scheduler immediately skips it. Its allocated bandwidth is natively redistributed among the other active queues.
+
+**Weaknesses:**
+
+- **ASIC Complexity**: The switch silicon must maintain persistent state (Deficit Counters) and perform per-packet arithmetic (subtracting variable byte lengths) for every queue at line rate. This is computationally more expensive than the simple counter logic of RR or WRR.
+
+#### Example: DWRR Scheduling Walkthrough
+
+The following walkthrough traces a single queue through three scheduling rounds, showing how the Deficit Counter accumulates credit, pays for each transmitted packet, and carries forward unused credit to the next round.
+
+<img src="../pics/dwrr.png" width="750"/>
+
 
 ```text
 Queue X (Quantum = 3000 bytes)
@@ -370,37 +368,23 @@ Round 3:
   ...
 ```
 
-**Motivation:** By tracking the exact byte size of every transmission and preserving unused credits across rounds, DWRR ensures that bandwidth distribution precisely matches the configured weights over time, completely irrespective of packet sizes.
 
-**Strengths:**
+#### How Weight Maps to Hardware
 
-- **True Byte-Level Fairness**: Delivers exact bandwidth percentages. A queue sending 1500-byte packets and a queue sending 64-byte packets will ultimately receive their exact configured bandwidth ratios.
+The operator configures only a relative integer **weight** per queue via `SAI_SCHEDULER_ATTR_SCHEDULING_WEIGHT`. The SAI specification defines this as a `sai_uint8_t` with a valid range of 1–255, but the actual range accepted by the hardware varies by platform. The weight value is passed directly through the software stack without transformation.
 
-- **No Wasted Bandwidth**: If a queue is empty, the scheduler immediately skips it. Its allocated bandwidth is natively redistributed among the other active queues.
+The SAI layer and the SDK do **not** compute a Quantum or perform any weight normalization. The raw weight integer is written directly to the ASIC's register. The ASIC's internal silicon-level scheduler uses these weight values to implement DWRR scheduling in hardware — maintaining deficit counters, computing per-round byte budgets, and determining transmission eligibility at line rate. These internal mechanics are opaque; the operator only sees weights.
 
-**Weaknesses:**
+The operator does not configure a Quantum directly — the SAI API does not expose one. Only the relative weight is visible. The hardware's internal translation of weight into scheduling behavior is entirely within the ASIC silicon.
 
-- **ASIC Complexity**: The switch silicon must maintain persistent state (Deficit Counters) and perform per-packet arithmetic (subtracting variable byte lengths) for every queue at line rate. This is computationally more expensive than the simple counter logic of RR or WRR.
+**Example:** Consider a 100 Gbps port with three DWRR queues configured with relative weights 5, 3, and 2:
 
+| Queue | Application   | Weight | Bandwidth Share |
+| ----- | ------------- | ------ | --------------- |
+| TC3   | RDMA          | 5      | 50%             |
+| TC1   | Standard Data | 3      | 30%             |
+| TC0   | Background    | 2      | 20%             |
 
-### A.4 Calculating the DWRR Quantum
+The bandwidth share is derived from the weight ratios (5 : 3 : 2 = 50 : 30 : 20). Over many scheduling rounds, the cumulative bytes transmitted from each queue converge on this ratio, regardless of individual packet sizes.
 
-The Quantum assigned to each queue is derived from two inputs: the queue's configured weight (expressed as a percentage of the port's total bandwidth) and the port's **Maximum Transmission Unit (MTU)**. The standard formula is:
-
-```
-Quantum = Weight (%) × MTU
-```
-
-The MTU serves as the natural scaling factor because the Quantum must be large enough to guarantee that at least one maximum-sized packet can always be transmitted per round. If the Quantum were smaller than the MTU, a queue could accumulate a deficit indefinitely without ever being able to transmit, effectively starving it.
-
-**Example:** Consider a 100 Gbps port with a 9000-byte jumbo MTU and three DWRR queues:
-
-| Queue | Application | Weight | Quantum Calculation | Quantum (Bytes) |
-| ----- | ----------- | ------ | ------------------- | --------------- |
-| TC3   | RDMA        | 50%    | 0.50 × 9000        | 4500            |
-| TC1   | Bulk Data   | 30%    | 0.30 × 9000        | 2700            |
-| TC0   | Best Effort | 20%    | 0.20 × 9000        | 1800            |
-
-Over many scheduling rounds, the cumulative bytes transmitted from each queue will converge on the 50:30:20 ratio, regardless of the individual packet sizes within each queue.
-
-> **Implementation note:** Some switch ASICs internally normalize weights or apply minimum Quantum floors to prevent edge cases where very small weights produce Quanta below common packet sizes. Vendor documentation should be consulted for platform-specific behavior.
+> The exact mechanism by which the ASIC translates a weight into scheduling decisions (quantum sizing, deficit tracking granularity, cell-size alignment) is vendor-specific and internal to the silicon. The operator controls only relative weights; the hardware guarantees proportional bandwidth convergence.

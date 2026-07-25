@@ -44,7 +44,7 @@ With $P_{max}$ at 100%, the marking probability ramps linearly from 0% at $K_{mi
 
 When the receiving NIC gets a packet with the ECN bits set to 11, it does not drop it. Instead, the receiver's hardware instantly generates a specialized message called a **Congestion Notification Packet** (CNP) and shoots it back to the original sender.
 
-<img src="../pics/DCQCN.png" width="800"/>
+<img src="../pics/DCQCN.jpg" width="800"/>
 
 Once the sending NIC receives the CNP, its hardware automatically throttles down its transmission rate using tuned mathematical parameters. This eases the load on the network, allowing the switch buffers to drain before they ever overflow. Once the CNPs stop arriving, the sender gradually ramps its speed back up. Under the conditions modeled in the original paper (Zhu et al., SIGCOMM 2015), the DCQCN loop converges on the order of 5–10 round-trip times, though actual convergence depends on parameter tuning, the number of competing flows, and congestion severity.
 

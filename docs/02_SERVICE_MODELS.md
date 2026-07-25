@@ -233,7 +233,7 @@ The Classifier inspects IP header fields — such as the DSCP value, source/dest
 - A packet with DSCP 46 (EF / Voice) might be mapped to a strict voice profile with a low committed rate and tight policing.
 - A packet with DSCP 0 (Best Effort) might be mapped to a permissive default profile with a large burst allowance.
 
-The Classifier does not modify the packet or assign a color. Its sole output is a policy selection: which set of Token Bucket parameters (CIR, CBS, PIR, PBS) the Meter should use for this packet. Once the policy is selected, the packet moves to the Meter and Marker.
+The Classifier does not modify the packet or assign a color. Its sole output is a policy selection: which set of Token Bucket parameters (CIR, CBS, PIR, PBS) the Meter should use for this packet. Each traffic class maintains its own independent token bucket — voice traffic is metered against the voice budget, best-effort traffic against the best-effort budget, and so on. They do not share a bucket. Once the policy is selected, the packet moves to the Meter and Marker.
 
 This is the bridge between the per-class world (traffic classes defined by DSCP tags) and the per-packet world (metering, marking, and policing described in the sections below). Every subsequent step operates on the individual packet using the profile the Classifier chose.
 

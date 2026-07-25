@@ -142,7 +142,7 @@ The idea of switch-generated backward signals is not new. [QCN](./03_CLASSIFICAT
 
 **Fast CNP** ([draft-xiao-rtgwg-rocev2-fast-cnp](https://datatracker.ietf.org/doc/draft-xiao-rtgwg-rocev2-fast-cnp/)) applies switch-direct backward feedback to RoCEv2. The draft is scoped to IPv6 only.
 
-<img src="../pics/fast-cnp.png" width="750"/>
+<img src="../pics/fast-cnp.jpg" width="750"/>
 
 **How it works:**
 
