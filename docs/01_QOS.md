@@ -6,7 +6,7 @@
 
 Every flow traversing a network is measured against four fundamental metrics. These metrics define what "good" and "bad" mean for different applications, and they are the basis for every QoS decision that follows.
 
-- **Packet Loss** — The fraction of transmitted packets that never reach the destination. Loss can result from buffer overflow (congestion), bit errors on the link, or policy-based drops (policing). Transport protocols like TCP detect and retransmit lost segments, but retransmission adds delay. Real-time protocols (RTP) and RDMA transports cannot afford the retransmission cost.
+- **Packet Loss** — The fraction of transmitted packets that never reach the destination. Loss can result from buffer overflow (congestion), bit errors on the link, or policy-based drops (policing). Transport protocols like TCP detect and retransmit lost segments, but retransmission adds delay. Real-time protocols (RTP) and RDMA transports cannot tolerate the retransmission cost.
 
 - **Latency (Delay)** — The time a packet takes to travel from source to destination. Total latency is the sum of propagation delay (speed of light in the medium), serialization delay (time to push bits onto the wire), processing delay (lookup and forwarding decisions at each hop), and queuing delay (time spent waiting in switch buffers). Of these, queuing delay is the only component that varies with load — and it is the component that QoS mechanisms directly control.
 
@@ -49,47 +49,6 @@ Best-effort works well for elastic traffic. TCP detects loss, retransmits, and a
 This breaks down for inelastic traffic. A VoIP flow sharing a congested link with a bulk file transfer will experience the same queue-induced delay and drops — but the VoIP call cannot retransmit a 200 ms-old voice sample. For lossless workloads the problem is even more severe: RDMA traffic treats any dropped packet as a transport-layer failure, triggering expensive recovery sequences that destroy the microsecond-scale latency the application depends on. Best-effort delivery offers no way to protect these flows.
 
 
-## Quality of Service
+## Quality of Service (QoS)
 
-**Quality of Service (QoS)** is the set of mechanisms that allow the network to treat different traffic classes differently. It does not add bandwidth — it controls how existing bandwidth, buffer space, and scheduling priority are allocated among competing flows. The goal is to guarantee that traffic with strict loss, latency, or jitter requirements receives the resources it needs, even when the network is congested.
-
-QoS is organized in six layers, each answering a distinct question:
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Layer 1: Architecture                                              │
-│  "How do we organize QoS across the network?"                       │
-│   → IntServ (per-flow reservations) vs. DiffServ (per-class marks)  │
-│   → DiffServ dominates Internet/campus; IntServ/RSVP in niches (MPLS-TE, etc.) │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 2: Marking (Tagging)                                         │
-│  "How does a packet declare its priority?"                          │
-│   → L3: DSCP (6-bit, 64 classes) — in the IP header                 │
-│   → L2: PCP  (3-bit, 8 levels)  — in the 802.1Q VLAN tag            │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 3: Per-Packet Enforcement                                    │
-│  "Is this individual packet within its allowed profile?"            │
-│   → Metering (Token Bucket / trTCM)                                 │
-│   → Policing (drop or remark out-of-profile packets)                │
-│   → Shaping (delay excess packets to smooth bursts)                 │
-│   → AQM / WRED (proactive drop/mark before queue overflow)          │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 4: Per-Class Treatment (DCB)                                 │
-│  "How does the switch treat entire traffic classes differently?"    │
-│   → Traffic Classes (TC0–TC7) — group priorities into queues        │
-│   → Egress Scheduling — SP, DWRR, or Hybrid per queue               │
-│   → ETS (802.1Qaz) — per-TC bandwidth allocation                    │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 5: Lossless Flow Control                                     │
-│  "How do we prevent packet loss for specific priorities?"           │
-│   → Priority Groups (PG) — ingress buffer allocation per priority   │
-│   → PFC (802.1Qbb) — per-priority PAUSE frames                      │
-│   → Threshold mechanics (Xoff, headroom, Xon)                       │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 6: End-to-End Congestion Control                             │
-│  "How does the sender know when to slow down?"                      │
-│   → ECN marking + CNP feedback (DCQCN)                              │
-│   → Richer signals — per-hop telemetry (IFA/INT), CSIG, RTT         │
-│   → Programmable reaction — custom algorithms on NIC (PCC)          │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Formally, Quality of Service is the totality of characteristics of a network service that determine its ability to satisfy the needs of its users (ITU-T E.800). In practice, Quality of Service is the set of mechanisms that allow the network to treat different traffic classes differently. It does not add bandwidth — it controls how existing bandwidth, buffer space, and scheduling priority are allocated among competing flows. The goal is to guarantee that traffic with strict loss, latency, or jitter requirements receives the resources it needs, even when the network is congested.
