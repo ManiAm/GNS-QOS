@@ -105,7 +105,6 @@ As a practical reference, Cisco's QoS Baseline maps common application types to 
 | EF (46)  | Voice              | VoIP bearer audio          |
 | CS6      | IP Routing         | OSPF, BGP, routing control |
 
-
 ### DiffServ Domains
 
 DiffServ does not operate as a single, global set of rules across the entire Internet. Instead, it is organized into **Domains**. A Domain is a contiguous network region under a single administrative authority — such as an ISP backbone, a corporate WAN, or a data center fabric. Within a Domain, two properties hold:
@@ -114,13 +113,11 @@ DiffServ does not operate as a single, global set of rules across the entire Int
 
 - **Trust boundary at the edge**: The Edge Routers (described above) enforce classification and policing at the Domain boundary. Core Routers inside the Domain trust the DSCP stamps applied at the edge and forward without re-inspection.
 
-
 ### Service Level Agreements (SLAs)
 
 Because the Internet is made up of thousands of different interconnected Domains, traffic eventually has to cross borders — for example, when a corporate enterprise network connects to an external ISP. When two different Domains connect (peer), they negotiate a **Service Level Agreement (SLA)**.
 
 Think of the SLA as a strict border contract. It specifies exactly how much traffic and what classes of traffic (e.g., 50 Mbps of voice traffic, 500 Mbps of bulk data) the customer domain is legally allowed to inject into the provider domain. If the customer sends more traffic than the SLA allows, the receiving Edge Router will either drop the excess packets or downgrade their priority.
-
 
 ### The Bandwidth Broker (BB)
 
@@ -136,50 +133,11 @@ A centralized controller may appear similar to IntServ's per-flow approach, but 
 
 
 
-
-
-## Switch Queuing Architecture
-
-This section covers how queues work inside a switch and why they exist. For background on the control plane and data plane, the transit path (ingress → switch fabric → egress), and traffic types (fast path vs slow path), see [Switch Architecture](https://github.com/ManiAm/net-lab-switch-serdes/blob/master/docs/01_README_npu.md).
-
-### The Need for Queues
-
-<img src="../pics/switch-internal.png" width="500"/>
-
-In a perfect world, a packet flows instantly from Ingress, across the Fabric, and out the Egress port. However, network traffic is rarely perfectly smooth; it is highly bursty. Congestion inevitably occurs—most often due to a "many-to-one" traffic pattern, where multiple Ingress ports simultaneously send traffic toward a single Egress port.
-
-Because an Egress cable can only transmit (serialize onto the wire) one packet at a time, the switch cannot immediately forward the excess traffic. Instead of instantly dropping these extra packets, the switch uses Queues. A queue is a logical "waiting line" that temporarily holds packets in strict order until the hardware is ready to transmit them.
-
-To manage traffic effectively, modern switches utilize queues at two distinct stages of the journey:
-
-- **Egress Queues** (The Final Staging Area): These queues sit right before the exit port. Their primary function is QoS scheduling and shaping. If multiple packets arrive at the exit simultaneously, the Egress queue organizes them, ensuring that high-priority traffic gets to skip the line and leave the switch before lower-priority traffic (like a background file download).
-
-- **Ingress Queues** (The Holding Area): These queues sit at the entrance of the switch, before the internal fabric. Their primary function is congestion absorption. If an Egress queue gets completely full, it signals the switch to stop sending it traffic. Packets destined for that overloaded exit must now wait in an Ingress queue until the internal traffic jam clears.
-
-### Head-of-Line (HoL) Blocking
-
-Because Ingress queues are essentially holding areas for traffic waiting to cross the switch, they are vulnerable to a severe performance flaw known as Head-of-Line (HoL) Blocking. This is strictly an Ingress phenomenon. Historically, older switches placed all incoming packets into a single, straightforward queue at the Ingress port.
-
-In a network switch, if the packet at the very front of a basic Ingress queue is destined for a congested Egress port, it stops moving. Consequently, it blocks all the packets behind it in the queue, even if those trailing packets are destined for perfectly idle Egress ports. The entire line stalls because of the head of the line.
-
-The following image demonstrates HOL blocking:
-
-<img src="../pics/switch-q-1.png" width="500"/>
-
-This switch fabric can only transfer one packet per destination port at a time. At time $t$, both the top and bottom input ports have a red-colored packet at the front of their lines, both trying to get to the top output port. The switch allows the top red packet to cross. The bottom red packet loses the contention and is stuck waiting. Because the bottom red packet is stuck at the head of the line, the green packet directly behind it cannot move, even though its destination (the bottom output port) is empty. This is Head-of-Line blocking.
-
-### Virtual Output Queuing (VOQ)
-
-To solve HoL blocking, modern high-performance switches use a sophisticated architecture called Virtual Output Queuing (VOQ). With VOQ, packets are still physically buffered on the Ingress side of the switch, but they are logically organized quite differently. Instead of one giant waiting line, the switch divides the Ingress buffer into multiple, separate logical queues—one dedicated queue for every possible Egress port.
-
-When a packet arrives at Ingress, the switch determines its destination and immediately places it into the specific VOQ for that exit. If Egress Port A becomes congested, only the VOQ for Port A backs up. A packet arriving at the exact same Ingress port, but destined for an uncongested Egress Port B, simply bypasses the traffic jam via its own dedicated VOQ.
-
-By buffering traffic at Ingress but organizing it by Egress destination, VOQ ensures that congestion on one port never degrades the performance of the rest of the switch. This organized, partitioned approach to traffic provides the stable foundation necessary for the measurement and policing algorithms described in the following sections.
-
-
 ## The DiffServ Traffic Management Pipeline
 
 To understand how a switch applies QoS, we must trace a packet through the complete DiffServ pipeline. The logical diagram below maps this pipeline onto the physical switch architecture, illustrating the journey from arrival to departure.
+
+> For a treatment of the underlying switch silicon architecture, see [Switch Architecture](https://github.com/ManiAm/net-lab-switch-serdes/blob/master/docs/01_switch_architecture.md).
 
 ```
             ┌─ INGRESS ─────────────────┐  ┌─ FABRIC ─────┐  ┌─ EGRESS ──────────────────┐
