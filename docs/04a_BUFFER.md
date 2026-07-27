@@ -1,7 +1,7 @@
 
 # Ingress Buffer Architecture
 
-Each ingress port supports up to eight Priority Groups (PG0–PG7), to which internal priorities are mapped. Each PG is configured as either lossy or lossless, and every active PG requires buffer memory to absorb arriving packets. With potentially hundreds of PGs across all ports, the ASIC must allocate its finite on-chip buffer efficiently — ensuring lossless PGs have sufficient depth to trigger PFC before overflow, while lossy PGs have enough space to absorb traffic bursts before dropping.
+Each ingress port supports up to eight Priority Groups (PG0–PG7), to which Traffic Classes are mapped. Each PG is configured as either lossy or lossless, and every active PG requires buffer memory to absorb arriving packets. With potentially hundreds of PGs across all ports, the ASIC must allocate its finite on-chip buffer efficiently — ensuring lossless PGs have sufficient depth to trigger PFC before overflow, while lossy PGs have enough space to absorb traffic bursts before dropping.
 
 Statically assigning a fixed, worst-case memory chunk for every PG on every port would rapidly exhaust the on-chip buffer. In practice, most ports are idle at any given microsecond while a few may be heavily congested. Fixed allocation wastes buffer on idle ports while congested ports drop packets because they hit their limits.
 

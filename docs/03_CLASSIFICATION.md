@@ -57,42 +57,44 @@ The DCB suite comprises four standards. Each is detailed in the sections that fo
 
 
 
-## Classification and the Internal Priority Pivot
+## Classification and the Traffic Class Pivot
 
-When a packet arrives, the switch must resolve its external marking into a single unified value for internal processing. Although the ASIC parser can read both DSCP and PCP headers, all downstream pipeline stages — buffer management, flow control, queue selection — reference a single normalized index. This index is the 3-bit **Internal Priority** (0–7). The switch uses a configurable **Trust Mode** on the ingress port to determine which incoming header to read when deriving this value:
+When a packet arrives, the switch must resolve its external marking into a single unified value for internal processing. Although the ASIC parser can read both DSCP and PCP headers, all downstream pipeline stages — buffer management, flow control, queue selection — reference a single normalized index: the 3-bit **Traffic Class** (TC 0–7). The switch uses a configurable **Trust Mode** on the ingress port to determine which incoming header to read when deriving this value:
 
-- **Trust DSCP**: Reads the 6-bit DSCP field and maps its 64 possible values down to the 8 internal priorities. Multiple DSCP values often map to a single internal priority (e.g., standard policies map DSCP 46 to internal priority 5).
+- **Trust DSCP**: Reads the 6-bit DSCP field and maps its 64 possible values down to 8 Traffic Classes via a `DSCP-to-TC` map. Multiple DSCP values often map to a single TC (e.g., standard policies map DSCP 46 to TC 5).
 
-- **Trust PCP**: Reads the 3-bit PCP field, which typically maps 1:1 to the internal priority.
+- **Trust PCP**: Reads the 3-bit PCP field and maps it to a TC via a `DOT1P-to-TC` map.
 
 - **Trust Both**: Dynamically reads DSCP for IP traffic and PCP for non-IP traffic (such as ARP or LLDP).
 
-Once the Internal Priority is established, it serves as the central pivot for two independent subsystems: the Ingress Path (memory allocation) and the Egress Path (scheduling).
+No IEEE or IETF standard mandates which traffic belongs in which TC number. TC assignment is a local policy decision; the specific number is irrelevant as long as the mapping is uniform across the fabric. In practice, vendors and industry groups publish recommended templates, such as the one in the [DCB Toolbox](#the-dcb-toolbox-tailoring-the-pipeline-to-application-needs) table below.
+
+Once the Traffic Class is established, it serves as the central pivot for two independent subsystems: the Ingress Path (memory allocation) and the Egress Path (scheduling).
 
 ```text
-                                       ┌─► Traffic Class (TC) ──► Egress Queue & ETS Scheduling
-                                       │   (IEEE 802.1Qaz)        (Determines WHEN it leaves)
-                                       │
-Incoming Packet ──► Internal Priority ─┤
-(DSCP or PCP)                          │
-                                       │
-                                       └─► Priority Group (PG) ──► Ingress Buffer & PFC State
-                                           (IEEE 802.1Qbb)         (Determines IF it pauses)
+                                          ┌──► Egress Queue ──► ETS Scheduling
+                                          │   (IEEE 802.1Qaz)   (Determines WHEN it leaves)
+                                          │
+Incoming Packet ──► Traffic Class (TC) ───┤
+(DSCP or PCP)                             │
+                                          │
+                                          └──► Priority Group (PG) ──► Ingress Buffer & PFC State
+                                              (IEEE 802.1Qbb)          (Determines IF it pauses)
 ```
 
 
 
 ## The Ingress Path: Memory and Loss Prevention (IEEE 802.1Qbb)
 
-Before a packet can be scheduled for egress, it must be successfully buffered into the switch's memory as it arrives. The Internal Priority dictates how this memory is allocated and managed.
+Before a packet can be scheduled for egress, it must be successfully buffered into the switch's memory as it arrives. The Traffic Class dictates how this memory is allocated and managed.
 
 ### Priority Groups (PG)
 
-The Internal Priority maps the packet to an ingress buffer partition known as a **Priority Group** (PG). A configurable Priority-to-PG table determines this assignment. The PG dictates two properties:
+The Traffic Class maps the packet to an ingress buffer partition known as a **Priority Group** (PG). A configurable `TC-to-PG` map determines this assignment. The PG dictates two properties:
 
-- **Buffer Allocation**: The amount of dedicated memory reserved for this traffic class. Each PG has a guaranteed headroom that absorbs in-flight packets while flow control takes effect.
+- **Buffer Allocation**: The amount of dedicated memory reserved for this traffic class.
 
-- **Lossless vs. Lossy Behavior**: Whether PFC (Priority-based Flow Control) is enabled for this PG. If PFC is enabled, the PG is lossless — an impending buffer overflow triggers a PAUSE frame to the upstream sender rather than dropping packets. If PFC is disabled, the PG is lossy — excess packets are tail-dropped when the buffer fills.
+- **Lossless vs. Lossy Behavior**: Whether PFC is enabled for this PG. If PFC is enabled, the PG is lossless — an impending buffer overflow triggers a PAUSE frame to the upstream sender rather than dropping packets. If PFC is disabled, the PG is lossy — excess packets are tail-dropped when the buffer fills.
 
 ### Priority-based Flow Control (PFC)
 
@@ -104,15 +106,13 @@ IEEE 802.1Qbb introduced Priority-based Flow Control (PFC). If a Priority Group 
 
 
 
-## The Egress Path: Classification and Queuing (IEEE 802.1Qaz)
+## The Egress Path: Queuing and Scheduling (IEEE 802.1Qaz)
 
 Once safely buffered in a Priority Group, the switch must determine how the packet will leave the device. This process is governed by IEEE 802.1Qaz, commonly known as Enhanced Transmission Selection (ETS).
 
-### Traffic Class (TC) Assignment
+### TC-to-Queue Assignment
 
-ETS introduces the logical concept of a **Traffic Class** (TC0–TC7). While the Priority Group dictates ingress memory, the Traffic Class dictates the egress grouping. The switch uses a configurable Priority-to-TC table to map the Internal Priority to one of these logical classes.
-
-No IEEE or IETF standard mandates which traffic belongs in which TC number. TC assignment is a local policy decision; the specific number is irrelevant as long as the mapping is uniform across the fabric. In practice, vendors and industry groups publish recommended templates, such as the one in the [DCB Toolbox](#the-dcb-toolbox-tailoring-the-pipeline-to-application-needs) table below.
+Each Traffic Class maps to a dedicated physical egress queue via a configurable `TC-to-Queue` map.
 
 ### Physical Silicon Queuing
 
@@ -125,6 +125,8 @@ With multiple physical queues holding different Traffic Classes, an ETS schedule
 - **Strict Priority (SP)**: The scheduler drains this queue completely before allowing any other queue to transmit. It guarantees the lowest latency for critical traffic (like VoIP or Congestion Notification Packets). The drawback is the risk of starvation; if the SP queue is constantly saturated, lower-priority queues cannot transmit.
 
 - **Deficit Weighted Round Robin (DWRR)**: Queues take turns transmitting based on a configured bandwidth percentage (weight). DWRR uses a deficit counter to track variable packet sizes, ensuring true *byte-level* fairness rather than simple *packet-count* fairness. This prevents starvation while respecting bandwidth tiers.
+
+> For a detailed treatment of how DWRR evolved from simpler scheduling algorithms (Round Robin and Weighted Round Robin), including how the DWRR Quantum is calculated, see [Appendix A](#appendix-a-the-evolution-of-egress-scheduling-algorithms).
 
 Multiple queues can be configured as Strict Priority simultaneously; when they are, the scheduler services them in descending priority order — TC7 is fully drained before TC6, TC6 before TC5, and so on. This creates a cascading starvation hierarchy where a higher SP queue can starve a lower SP queue, and all SP queues collectively starve the DWRR queues beneath them. For this reason, SP is reserved exclusively for traffic that is both latency-critical **and** inherently low-volume.
 
@@ -143,22 +145,16 @@ Scheduler
     └── TC0: Background                ◄── DWRR (weight: 15%)
 ```
 
-By strictly separating ingress buffering (PGs) from egress scheduling (TCs) — both branching from the centralized Internal Priority — modern architectures seamlessly run lossless flows alongside lossy data on the exact same physical infrastructure. Each flow class operates with independent buffering and scheduling parameters, so their behaviors remain fully isolated.
-
-> For a detailed treatment of how DWRR evolved from simpler scheduling algorithms (Round Robin and Weighted Round Robin), including how the DWRR Quantum is calculated, see [Appendix A](#appendix-a-the-evolution-of-egress-scheduling-algorithms).
-
-
-
 
 ## The DCB Toolbox: Tailoring the Pipeline to Application Needs
 
-While the dual-mapping architecture described above makes converged networks possible, it also invites a common misconception. Because DCB is frequently marketed under the umbrella of "Lossless Ethernet," operators sometimes assume it is an all-or-nothing switch: either the entire link is lossless, or DCB is irrelevant. In reality, losslessness (PFC) is only one component. DCB is a modular toolbox. A converged network succeeds by allowing each application class to consume only the specific DCB components that serve its needs, while ignoring the rest.
+DCB is often called "Lossless Ethernet," which leads to a common misconception: that it is an all-or-nothing switch — either the entire link is lossless or DCB is irrelevant. In reality, losslessness (PFC) is just one component. DCB is a modular toolbox, and each application class uses only the pieces it needs.
 
-Here is how different traffic profiles navigate the exact same DCB pipeline:
+Two examples show how different applications use the same physical link but rely on completely different DCB components:
 
-- **The Need for Speed (Latency-Sensitive)**: Applications like real-time Voice over IP (VoIP) or routing control protocols (BGP) are not configured with PFC. For these applications, the buffering latency introduced by flow control would degrade real-time audio or delay routing convergence. Therefore, they map to standard lossy Priority Groups on the ingress side. If the buffer fills, the switch drops excess packets — an acceptable trade-off, since brief loss is preferable to added latency. However, because they share the egress port with high-volume data flows, they rely on the scheduling mechanism, ETS (802.1Qaz). They are placed in a Strict Priority (SP) queue, ensuring they are transmitted before bulk data.
+- **Latency-sensitive traffic** (VoIP, BGP): These applications care about delay, not about occasional packet loss. A dropped voice sample causes a brief glitch; a delayed one is useless. PFC would actually hurt here — pausing the sender adds buffering latency. So these map to a **lossy** PG (no PFC). If the buffer fills, the switch drops excess packets rather than pausing. On the egress side, they are placed in a **Strict Priority** queue so the scheduler always transmits them before bulk data.
 
-- **The Need for Perfection (Loss-Sensitive)**: Applications like RoCEv2 or iSCSI-based storage cannot tolerate dropped packets. They enable PFC on the ingress port to prevent packet loss, creating a lossless Priority Group. On the egress port, rather than using Strict Priority scheduling — which would starve other traffic classes due to their sustained high volume — they rely on ETS configured with DWRR weights. This allows them to share the remaining bandwidth proportionally with other traffic classes.
+- **Loss-sensitive traffic** (RoCEv2, iSCSI): These applications cannot tolerate any packet loss — a single drop triggers expensive transport-layer recovery. They map to a **lossless** PG with PFC enabled, so the switch pauses the sender before the buffer overflows. On the egress side, they use **DWRR** (weighted round-robin) scheduling instead of Strict Priority. Why? Because they push sustained high volume. If they were in a Strict Priority queue, they would starve every other traffic class on the port.
 
 The table below is a unified reference showing how each traffic type uses the full DCB pipeline. The TC assignments and DSCP-to-TC mappings are widely adopted industry conventions, not mandated standards. The specific assignment is an operator decision — what matters is that the same mapping is applied consistently from the NIC through every switch in the fabric.
 

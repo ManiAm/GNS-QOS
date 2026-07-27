@@ -26,7 +26,7 @@ To execute this "soft brake" across a routed network, DCQCN relies on a continuo
 The rest of this document follows this three-stage loop in order: the CP's detection and marking logic, the NP's CNP generation, and the RP's rate control algorithm.
 
 
-## The Congestion Point (WRED)
+## The Congestion Point (WRED with ECN)
 
 The Congestion Point is the switch's egress queue, where WRED (Weighted Random Early Detection) monitors buffer depth and ECN-marks passing packets as congestion builds. The full mechanics of RED, ECN, and WRED color profiles are covered in the [Active Queue Management](02_SERVICE_MODELS.md#active-queue-management) section. This section focuses on how RoCEv2 networks configure WRED differently from standard IP deployments.
 
