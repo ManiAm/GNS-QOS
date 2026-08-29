@@ -416,13 +416,17 @@ This design means that configuring "RED" versus "RED with ECN" on a switch is no
 
 ### Packet Trimming — The Third Congestion Action
 
-In high-performance AI and HPC fabrics, traditional congestion control mechanisms at the egress queue face fundamental limitations when buffers reach capacity:
+The previous sections introduced two actions a switch can take at the egress queue when congestion builds: dropping (RED/WRED) and marking (ECN). Packet Trimming is a third action, designed for scenarios where neither dropping nor marking is sufficient:
 
-- **Dropping (RED)**: Completely destroys the packet. The receiver has no immediate knowledge of the loss, forcing the transport layer to rely on a retransmission timeout (RTO). This delay — typically tens to hundreds of milliseconds — is catastrophic for tightly synchronized workloads.
+| Congestion action   | What the switch does | What the sender learns | Limitation |
+|---------------------|---------------------|----------------------|------------|
+| **Drop** (RED/WRED) | Destroy the packet entirely | Nothing — must wait for a retransmission timeout or SACK gap | Slow recovery; the sender has no immediate signal |
+| **Mark** (ECN)      | Preserve the packet, flip ECN bits to CE | "Slow down" — a proactive early warning | No help once the queue is full and packets must be discarded |
+| **Trim**            | Strip the payload, forward only the headers on a high-priority queue | "This specific packet was lost to congestion, but the path is alive" | Requires transport support (e.g., NACK-based selective retransmission) |
 
-- **Marking (ECN)**: Preserves the packet but acts only as a proactive, early-warning signal to slow the sender down. It offers no recovery mechanism once a queue is entirely overwhelmed and packets must be discarded.
+Dropping completely destroys the packet. The receiver has no immediate knowledge of the loss, forcing the transport layer to rely on a retransmission timeout (RTO). This delay — typically tens to hundreds of milliseconds — is catastrophic for tightly synchronized workloads. ECN marking preserves the packet but acts only as a proactive, early-warning signal to slow the sender down. It offers no recovery mechanism once a queue is entirely overwhelmed and packets must be discarded.
 
-Packet Trimming introduces a third paradigm for severe congestion. Instead of silently discarding a packet when a buffer fills, the switch truncates it. The payload is stripped, but the transport headers are preserved and forwarded. This allows the receiver to instantly identify the missing data and issue a selective retransmission request (NACK), recovering the payload in a single round-trip without waiting for an RTO.
+Packet Trimming fills the gap between these two extremes. Instead of silently discarding a packet when a buffer fills, the switch truncates it. The payload is stripped, but the transport headers are preserved and forwarded. This allows the receiver to instantly identify the missing data and issue a selective retransmission request (NACK), recovering the payload in a single round-trip without waiting for an RTO.
 
 #### Trim Eligibility
 
@@ -440,44 +444,29 @@ Regardless of how eligibility is determined, the switch must signal to the recei
 
 #### End-to-End Workflow
 
-With trim eligibility and priority promotion established, the end-to-end mechanism operates as follows:
+<img src="../pics/trimming.png" width="700"/>
 
-```text
-Source Host                   Congested Switch                  Destination Host
-┌───────────┐                 ┌──────────────────┐              ┌──────────────┐
-│ Sends     │─── 1500B pkt ──►│ Egress queue     │              │              │
-│ data      │                 │ is full.         │              │              │
-│ packet    │                 │ Packet eligible. │              │              │
-└───────────┘                 │                  │              │              │
-                              │ 1. Trim packet   │              │              │
-                              │ 2. Update IP len │              │              │
-                              │ 3. Rewrite DSCP  │              │              │
-                              │    → TRIMMED     │              │              │
-                              │ 4. Forward on    │──► trimmed ─►│ Sees TRIMMED │
-                              │    trim queue    │    packet    │ DSCP. Headers│
-                              │ 5. Drop original │              │ intact.      │
-                              └──────────────────┘              │              │
-                                                                │ Sends NACK   │
-Source Host                                                     │ to source    │
-┌────────────┐◄────────────── selective retransmit request ─────│ for immediate│
-│ Retransmit │                                                  │ retransmit.  │
-│ immediately│                                                  └──────────────┘
-└────────────┘
-```
+Source A sends a full-size frame (Ethernet | IP | Transport | Payload | FCS) across the fabric. The **Trimmable DSCP** label in the diagram indicates that the IP header's DSCP field carries a codepoint marking this packet as eligible for trimming. The frame traverses two switches without issue. At the third switch, the egress queue is congested — shown by the red burst.
 
-The five operations the congested switch performs on the packet:
+Instead of dropping the packet, the congested switch performs five operations:
 
-1. **Trim** — Create a copy of the packet truncated to a configured size (e.g., 128 bytes), preserving the Ethernet, IP, and transport headers.
-2. **Update IP fields** — Rewrite the IP total length and recalculate the IP header checksum in the trimmed copy to reflect the reduced size.
-3. **Mark DSCP** — Set the DSCP field in the trimmed copy to the configured TRIMMED value, so the receiver can distinguish it from normal data.
-4. **Forward on trim queue** — Send the trimmed copy through a separate egress queue (the "trim queue") that is not congested, ensuring delivery.
-5. **Drop the original** — Discard the original full-size packet. It is counted in the queue's standard drop statistics.
+1. **Truncate** the packet to a configured size (typically 128–256 bytes), keeping the Ethernet, IP, and transport headers but stripping the payload.
+
+2. **Update the IP total length** and recalculate the IP header checksum to reflect the smaller packet.
+
+3. **Rewrite the DSCP** field to the configured **Trimmed** codepoint, so every downstream device knows this packet was intentionally truncated.
+
+4. **Recalculate the FCS.** The original FCS was computed over the full frame — headers and payload combined — so it is now invalid. The switch computes a new checksum over the trimmed frame. This is why the diagram labels it **FCS\***: the trimmed packet is a valid Ethernet frame with a fresh checksum, not a corrupt fragment. It passes Layer 2 integrity checks at every downstream hop.
+
+5. **Forward the trimmed copy** through a high-priority egress queue (the "trim queue") that is not congested, bypassing the bottleneck. The original full-size packet is dropped and counted in the queue's standard drop statistics.
+
+Destination B receives the trimmed packet, sees the Trimmed DSCP, and knows exactly which flow lost data — all the transport headers (including sequence numbers) are intact. The receiver immediately sends a selective retransmission request (NACK) back to Source A, which retransmits only the missing payload. The entire recovery completes in a single round-trip, without waiting for a retransmission timeout.
 
 #### Switch Configuration Parameters
 
 To implement packet trimming on modern data center switch ASICs, four core parameters must be defined:
 
-- **Size**: The maximum byte length of the trimmed packet. The value must be large enough to preserve the headers the receiver needs to identify the original flow and request retransmission:
+- **Trim Size**: The maximum byte length of the trimmed packet. The value must be large enough to preserve the headers the receiver needs to identify the original flow and request retransmission:
 
   | Header   | Size (bytes) |
   |----------|--------------|
@@ -490,7 +479,7 @@ To implement packet trimming on modern data center switch ASICs, four core param
   | **Minimum for flow ID (IPv4 + BTH)** | **~46** |
   | **Typical configured size** | **128–256** |
 
-  The configured size is set well above the minimum to accommodate optional headers (VLAN tags, GRE/VXLAN encapsulation) and transport metadata such as sequence numbers. Networks using tunneling or encapsulation require a larger trim size to preserve the inner headers.
+  The configured size is set well above the minimum to accommodate optional headers (VLAN tags, GRE/VXLAN encapsulation) and transport metadata such as sequence numbers. Networks using tunneling or encapsulation require a larger trim size to preserve the inner headers. The trim size is a network-wide parameter — all switches in the fabric must use the same value to ensure consistent behavior.
 
 - **DSCP Mapping**: The DSCP value written into the trimmed packet's IP header (the TRIMMED codepoint). In implementations that use DSCP-based eligibility, administrators can also configure which incoming DSCP values are eligible for trimming.
 
@@ -499,3 +488,29 @@ To implement packet trimming on modern data center switch ASICs, four core param
 - **Queue**: The specific egress queue assigned for forwarding the trimmed traffic. Depending on the platform, this is either an explicit index or dynamically derived from the Traffic Class.
 
 Packet Trimming is a foundational element of the Ultra Ethernet Transport (UET) specification by the Ultra Ethernet Consortium (UEC). It is actively supported by modern switch architectures — including NVIDIA Spectrum-4, Broadcom Tomahawk 5, and Marvell Teralynx — making it a critical mechanism for zero-drop, low-tail-latency AI environments.
+
+#### Trim Size and ASIC Cell Size
+
+Switch ASICs do not store packets as contiguous byte streams. The Memory Management Unit (MMU) slices each incoming packet into fixed-size units called **cells** — the smallest unit of buffer allocation. A 1500-byte packet, for example, occupies multiple cells, linked together by an internal pointer chain. Cell size is a hardware constant that varies by platform:
+
+| Platform family                          | Cell size |
+|------------------------------------------|-----------|
+| NVIDIA Spectrum-1                        | 96 bytes (48 × 2)  |
+| NVIDIA Spectrum-2 / Spectrum-3           | 144 bytes (48 × 3) |
+| NVIDIA Spectrum-4                        | 192 bytes (48 × 4) |
+| Broadcom Trident II (Memory Model-based) | 208 bytes |
+| Broadcom Tomahawk 3/4                    | 254 bytes |
+| Nokia 7220 IXR-H5                        | 206 bytes |
+| Nokia 7220 IXR-H6                        | 392 bytes |
+
+How the ASIC organizes data within each cell depends on the architecture. Two models are common:
+
+1. **Embedded-metadata model (Broadcom, Nokia).** The first cell of a packet is split between internal metadata (40–64 bytes of per-packet state — pointers, scheduling context, QoS tags) and the beginning of the packet data. Subsequent cells carry only packet data. Because metadata occupies part of the first cell, the usable space for packet bytes in that cell is `cell_size − metadata_overhead`.
+
+2. **Separate-descriptor model (NVIDIA Spectrum).** Metadata is stored in a dedicated descriptor buffer, entirely outside the cell array. Every cell — including the first — holds only packet data.
+
+<img src="../pics/cell_storage_model.png" width="700"/>
+
+This cell structure directly constrains the trim size. On platforms that use the embedded-metadata model, a trimmed packet should ideally fit within a single cell. The effective maximum is approximately `cell_size − metadata_overhead`, which is why the actual trimmed packet size may differ from the configured value by a few bytes — the ASIC rounds to cell boundaries. On Nokia IXR-H5/H6, the trim size is non-configurable and fixed to exactly one cell minus metadata. On Spectrum-4, where metadata is stored separately, the configurable range is 256–1024 bytes (must be a multiple of 4).
+
+The buffer benefit is direct: a 1500-byte packet occupies 6–8 cells depending on the ASIC. After trimming, it occupies one cell. The remaining cells are immediately freed back to the shared buffer pool, relieving the very congestion that triggered the trim.

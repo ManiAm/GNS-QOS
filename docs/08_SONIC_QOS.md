@@ -21,46 +21,155 @@ show interfaces status
 ```
 
 
-## How SONiC Stores QoS Configuration
 
-SONiC does not use flat configuration files like traditional network operating systems. Instead, all configuration lives in a Redis database called **CONFIG_DB**. The QoS pipeline is defined by a set of interrelated tables within this database.
+## Key QoS Concepts --> move pool and profile into buffer doc and remove this whole section
 
-CONFIG_DB is Redis database index **4**. There are two equivalent CLI interfaces to access it:
+Before diving into SONiC configuration, you need to understand the building blocks. Each concept below depends on the ones above it.
+
+### Traffic Class (TC)
+
+A numeric label (0–7) assigned to each packet inside the switch. The packet's original DSCP value (a field in the IP header) is mapped to a TC at ingress. Everything downstream — buffering, scheduling, PFC — operates on TCs, not on raw DSCP values.
+
+### Priority Group (PG)
+
+An ingress buffer bucket. Each port has 8 PGs (0–7). Packets are assigned to a PG based on their TC (via a `TC-to-PG` map). The PG determines which ingress buffer pool the packet draws memory from and whether PFC (pause) can be triggered for that traffic.
+
+### Queue
+
+An egress buffer bucket. Each port has 8 queues (0–7). Packets are assigned to a queue based on their TC (via a `TC-to-Queue` map). The scheduler drains queues onto the wire.
+
+### Buffer Pool
+
+A region of shared memory on the ASIC. There are typically four pools:
+
+| Pool                    | Direction | Purpose |
+|-------------------------|-----------|---------|
+| `ingress_lossless_pool` | Ingress   | Holds PFC-eligible (lossless) traffic |
+| `ingress_lossy_pool`    | Ingress   | Holds best-effort (lossy) traffic |
+| `egress_lossless_pool`  | Egress    | Holds outgoing lossless traffic |
+| `egress_lossy_pool`     | Egress    | Holds outgoing lossy traffic |
+
+Each pool has a **size** (total bytes) and a **mode** (static or dynamic):
+
+- **Static**: each user of the pool gets a fixed byte reservation.
+
+- **Dynamic**: each user gets a share calculated from a threshold parameter (`dynamic_th`, which maps to an alpha value). Higher alpha = larger share of remaining free space.
+
+> **Dual admission:** A packet must be admitted to *both* an ingress pool and an egress pool to be forwarded. If *either* check fails, the packet is dropped (or PFC is triggered for lossless priorities). This means buffer tuning on one side alone is not sufficient — both ingress and egress pools must be sized and configured correctly.
+
+### Buffer Profile
+
+A profile tells the ASIC "when a PG or queue uses a buffer pool, here are its admission rules." A profile specifies:
+
+- Which **pool** it draws from.
+- Whether it uses a **static threshold** (fixed byte limit) or a **dynamic threshold** (alpha-based share).
+- For lossless PGs: **xoff** -- the fill level at which PFC pause is sent to the upstream sender.
+
+
+
+
+
+
+
+
+
+Every packet that enters or exits a switch port is stored temporarily in on-chip memory while the forwarding pipeline processes it. A **buffer pool** is a named region of that memory reserved for a specific direction and purpose. Traffic can only use the pool it is assigned to — it cannot spill into another pool.
+
+> **Dual admission:** A packet must be admitted to *both* an ingress pool and an egress pool to be forwarded. If *either* check fails, the packet is dropped (or PFC is triggered for lossless priorities). This means buffer tuning on one side alone is not sufficient — both ingress and egress pools must be sized and configured correctly.
+
+Each pool's memory is internally divided into three regions, corresponding to the three buffer tiers described in [Ingress Buffer Architecture](04a_BUFFER.md):
+
+1. **Guaranteed** — A small reserved allocation per Priority Group (ingress) or queue (egress), configured via the buffer profile's `size` field. Each consumer is guaranteed this memory regardless of congestion.
+
+2. **Shared** — The remaining pool memory after guaranteed allocations. Consumers borrow from this region up to a limit set by their profile's threshold (`dynamic_th` or `static_th`).
+
+3. **Headroom** — (Ingress lossless pool only.) Reserved for packets in flight after a PFC PAUSE frame has been sent. Configured via the pool's `xoff` field.
+
+**Key pool fields:**
+
+- **`type`** — `ingress` or `egress`. Determines whether the pool serves incoming or outgoing traffic.
+- **`mode`** — `static` or `dynamic`. Controls how the shared region is divided among consumers (see profile thresholds below).
+- **`size`** — Total memory allocated to the pool, in bytes (includes all three regions).
+- **`xoff`** — (Ingress lossless pool only.) Size of the headroom region in bytes.
+
+### Buffer Profile
+
+A buffer pool defines a block of memory, but it says nothing about *who* can use it or *how much* each consumer can take. That is the job of a **buffer profile**.
+
+A buffer profile is a policy that says: "Consumers attached to me may draw from *this* pool, up to *this* threshold." The relationship flows like this:
+
+```
+Pool  ←  Profile  ←  Port PG / Queue
+```
+
+1. A **pool** allocates a chunk of switch memory.
+2. A **profile** references one pool and defines the admission policy (thresholds).
+3. Each **port's Priority Group (PG)** or **queue** is bound to one profile, which determines where its packets are buffered and how much space it can use.
+
+Each profile has these fields:
+
+- **`pool`** — Which pool this profile draws memory from.
+- **`size`** — A guaranteed (reserved) allocation in bytes. This memory is exclusively reserved for each consumer that uses this profile. Even when the pool is congested, each consumer is guaranteed at least this much. A `size` of `0` means no guaranteed reservation; the consumer relies entirely on the shared portion of the pool.
+
+The remaining fields depend on the pool's mode:
+
+**Static mode** (e.g., `egress_lossless_pool`):
+
+- **`static_th`** — A hard byte limit. Each consumer can use up to `size + static_th` bytes total. Once this threshold is reached, additional packets are dropped (or PFC is triggered).
+
+**Dynamic mode** (e.g., `ingress_lossless_pool`, `egress_lossy_pool`):
+
+- **`dynamic_th`** — An alpha exponent (integer, range −8 to 8) that controls how much of the pool's *currently available* shared space a consumer may use. The limit adjusts in real time as the pool fills and drains — a higher exponent allows more aggressive borrowing, while a lower exponent restricts the consumer to a smaller fraction. For the full alpha formula, value table, and behavioral details, see [Dynamic Thresholds](04a_BUFFER.md#tier-2-shared-pool).
+
+**Lossless ingress profiles** have additional fields that control PFC PAUSE behavior (see [PFC Thresholds](04_PFC.md#pfc-thresholds-managing-the-buffer) for conceptual background):
+
+- **`xoff`** — XOFF threshold in bytes. Sized for round-trip propagation delay (cable length, port speed) plus sender response time.
+- **`xon`** — XON threshold in bytes. The gap between `xoff` and `xon` provides hysteresis to prevent rapid pause/resume oscillation.
+- **`xon_offset`** — Alternative way to express the XON point as `headroom_size - xon_offset`. When both are set, the effective XON threshold is `max(xon, size - xon_offset)`.
+- **`size`** — Total headroom reserved for the PG. Must be at least `xoff` plus a safety margin.
+
+These values depend on port speed and cable length. SONiC provides a lookup table at `pg_profile_lookup.ini` in the hwsku directory with pre-calculated values:
 
 ```bash
-# SONiC wrapper — references the database by name
-sonic-db-cli CONFIG_DB HGETALL "DSCP_TO_TC_MAP|AZURE"
-
-# Raw Redis — references the database by index (-n 4)
-redis-cli -n 4 HGETALL "DSCP_TO_TC_MAP|AZURE"
+cat $(python3 -c "from sonic_py_common import device_info; print(device_info.get_paths_to_platform_and_hwsku_dirs()[1])")/pg_profile_lookup.ini
 ```
 
-Both commands return the same result. Any Redis operation (`HGETALL`, `HSET`, `HGET`, etc.) works with either interface.
-
-> **Formatting tip:** `HGETALL` returns key-value pairs as alternating lines, which is hard to read. Pipe through `paste - -` to join each pair into a tab-separated row, and `sort -n` to sort numerically:
->
-> ```bash
-> redis-cli -n 4 HGETALL "DSCP_TO_TC_MAP|AZURE" | paste - - | sort -n
-> ```
-
-The key format is `TABLE_NAME|ENTRY_NAME`, where:
-
-- **`DSCP_TO_TC_MAP`** is the **table** — the type of configuration (in this case, the DSCP-to-TC mapping table).
-- **`AZURE`** is the **entry name** (also called the profile or map name) — a named instance within that table. A single table can hold multiple named profiles, but SONiC ships with one default profile called `AZURE`. The name is inherited from SONiC's origins as the network OS for Microsoft Azure's data center switches.
-
-Some tables use a different key format. For per-port tables, the entry name includes the port and optionally a queue or Priority Group index:
+Example entries:
 
 ```
-PORT_QOS_MAP|Ethernet0      →  per-port QoS bindings for Ethernet0
-QUEUE|Ethernet0|3            →  queue 3 policy on Ethernet0
-BUFFER_PG|Ethernet0|3-4      →  buffer profile for PG 3–4 on Ethernet0
+# speed cable size    xon  xoff    threshold xon_offset
+ 100000  5m   1248    2288 165568  0         2288
+ 100000  40m  1248    2288 177632  0         2288
+ 100000  300m 1248    2288 268736  0         2288
 ```
 
-> **Important:** On a freshly installed switch, these tables are **empty**. SONiC stores its QoS defaults in Jinja2 templates on disk, not in Redis. You must explicitly run `config qos reload` (Step 1) to render those templates and populate CONFIG_DB. Until you do, any `HGETALL` query against these keys returns an empty result.
+A 100 Gbps port with a 5m cable needs 165568 bytes of XOFF headroom, while a 300m cable needs 268736 bytes — longer cables mean more in-flight data during the PAUSE round-trip.
 
-### The QoS Tables
 
-The tables are organized into four functional groups. Each group corresponds to a stage of the DiffServ pipeline.
+
+### PFC (Priority-based Flow Control)
+
+PFC lets a switch send a pause frame to the upstream device for a *specific priority*, telling it to stop sending traffic on that priority while allowing other priorities to continue. This prevents drops for lossless traffic classes (typically RDMA). The `xoff` threshold in the buffer profile controls when the pause is triggered.
+
+### Scheduling
+
+The scheduler decides the order in which egress queues are drained onto the wire. SONiC supports two scheduler types:
+- **DWRR** (Deficit Weighted Round Robin) — queues share bandwidth proportionally by weight. For the algorithm details, see [Appendix A](03_CLASSIFICATION.md#appendix-a-the-evolution-of-egress-scheduling-algorithms).
+- **Strict Priority** — the queue is always drained first (before any DWRR queues), optionally rate-limited by CIR/PIR. Used for latency-sensitive traffic like control plane packets.
+
+### WRED (Weighted Random Early Detection)
+
+WRED proactively drops or ECN-marks packets *before* a queue is completely full, signaling senders to slow down. It uses min/max thresholds and a drop probability. When WRED is disabled but ECN is enabled (`ecn_all`), the switch only marks packets with the ECN bit — it does not randomly drop them.
+
+
+
+
+
+
+
+## How SONiC Stores QoS Configuration
+
+SONiC uses a centralized **Config DB** (a Redis database) to store all switch configuration. The relevant tables for QoS and buffers are:
 
 **Group 1 — Classification Maps** (What class does this packet belong to?)
 
@@ -103,6 +212,7 @@ This single table is the top-level configuration point for each physical port. I
 | --------------- | ---------------- |
 | `PORT_QOS_MAP`  | Associates each port with named map profiles and sets PFC-enabled priorities |
 
+
 ### How These Tables Connect
 
 The following diagram traces the data flow. A packet arriving on an ingress port is classified by the maps in Group 1, buffered through the Group 2 hierarchy, crosses the fabric, and is scheduled out by the Group 3 policies:
@@ -126,6 +236,51 @@ The following diagram traces the data flow. A packet arriving on an ingress port
   PORT_QOS_MAP (Group 4):  binds all named maps to each physical port
                            also sets pfc_enable (which priorities trigger PFC)
 ```
+
+
+
+
+### How to Access
+
+
+CONFIG_DB is Redis database index **4**. There are two equivalent CLI interfaces to access it:
+
+```bash
+# SONiC wrapper — references the database by name
+sonic-db-cli CONFIG_DB HGETALL "DSCP_TO_TC_MAP|AZURE"
+
+# Raw Redis — references the database by index (-n 4)
+redis-cli -n 4 HGETALL "DSCP_TO_TC_MAP|AZURE"
+```
+
+Both commands return the same result. Any Redis operation (`HGETALL`, `HSET`, `HGET`, etc.) works with either interface.
+
+> **Formatting tip:** `HGETALL` returns key-value pairs as alternating lines, which is hard to read. Pipe through `paste - -` to join each pair into a tab-separated row, and `sort -n` to sort numerically:
+>
+> ```bash
+> redis-cli -n 4 HGETALL "DSCP_TO_TC_MAP|AZURE" | paste - - | sort -n
+> ```
+
+The key format is `TABLE_NAME|ENTRY_NAME`, where:
+
+- **`DSCP_TO_TC_MAP`** is the **table** — the type of configuration (in this case, the DSCP-to-TC mapping table).
+- **`AZURE`** is the **entry name** (also called the profile or map name) — a named instance within that table. A single table can hold multiple named profiles, but SONiC ships with one default profile called `AZURE`. The name is inherited from SONiC's origins as the network OS for Microsoft Azure's data center switches.
+
+Some tables use a different key format. For per-port tables, the entry name includes the port and optionally a queue or Priority Group index:
+
+```
+PORT_QOS_MAP|Ethernet0      →  per-port QoS bindings for Ethernet0
+QUEUE|Ethernet0|3            →  queue 3 policy on Ethernet0
+BUFFER_PG|Ethernet0|3-4      →  buffer profile for PG 3–4 on Ethernet0
+```
+
+> **Important:** On a freshly installed switch, these tables are **empty**. SONiC stores its QoS defaults in Jinja2 templates on disk, not in Redis. You must explicitly run `config qos reload` (Step 1) to render those templates and populate CONFIG_DB. Until you do, any `HGETALL` query against these keys returns an empty result.
+
+
+
+
+
+
 
 
 ## Step 1 — Load the Default QoS Configuration
@@ -307,18 +462,9 @@ The `pfc_enable` field lists the priority indices on which PFC PAUSE frames are 
 show buffer configuration
 ```
 
-This displays the buffer pools, buffer profiles, and per-port PG/queue buffer assignments. The output has three sections: **Pools**, **Profiles**, and per-port assignments. Understanding the relationship between these concepts is essential before customizing buffers.
+This displays the buffer pools, buffer profiles, and per-port PG/queue buffer assignments. For background on pools, profiles, memory regions, and threshold fields, see [Buffer Pool](#buffer-pool) and [Buffer Profile](#buffer-profile) in the Key QoS Concepts section above.
 
-
-
-
-#### What is a Buffer Pool?
-
-Every packet that enters or exits a switch port is stored temporarily in on-chip memory (packet buffer) while the forwarding pipeline processes it. A **buffer pool** is a named region of that memory reserved for a specific direction and purpose.
-
-Think of the switch's total packet buffer as a building, and each pool as a floor in that building. Traffic can only use the floor it is assigned to — it cannot spill into another floor.
-
-> **Dual admission:** A packet must be admitted to *both* an ingress pool and an egress pool to be forwarded. When a packet arrives on a port, the ingress admission check decides whether there is room to accept it. Simultaneously, the egress admission check decides whether the destination output queue has room. If *either* check fails, the packet is dropped (or PFC is triggered for lossless priorities). This means buffer tuning on one side alone is not sufficient — both ingress and egress pools must be sized and configured correctly.
+#### Default Buffer Pools
 
 The default configuration defines three pools:
 
@@ -328,67 +474,9 @@ The default configuration defines three pools:
 | `egress_lossy_pool`     | Egress    | Dynamic | ~8.8 MB  | Holds outgoing packets for lossy queues. When full, excess packets are tail-dropped. |
 | `egress_lossless_pool`  | Egress    | Static  | ~15.2 MB | Holds outgoing packets for lossless queues (PFC-protected priorities 3 and 4). Sized large enough to absorb bursts without dropping while PFC backpressure propagates. |
 
-#### Inside a Buffer Pool: Three Memory Regions
+> **Why does the ingress lossy profile use the "lossless" pool?** SONiC's Memory-Table buffer model typically has a single ingress pool. The pool is named `ingress_lossless_pool` because it contains the lossless headroom (`xoff` reserve), but all ingress traffic — lossy and lossless — draws from it. The distinction between lossy and lossless at the ingress is handled by PG-level profile thresholds and PFC, not by separate pools.
 
-Each pool's memory is internally divided into three regions. These correspond to the three buffer tiers described in [Ingress Buffer Architecture](04a_BUFFER.md):
-
-1. **Guaranteed** — A small reserved allocation per Priority Group (ingress) or queue (egress), configured via the buffer profile's `size` field. Each consumer is guaranteed this memory regardless of congestion.
-
-2. **Shared** — The remaining pool memory after guaranteed allocations. Consumers borrow from this region up to a limit set by their profile's threshold (`dynamic_th` or `static_th`).
-
-3. **Headroom** — (Ingress lossless pool only.) Reserved for packets in flight after a PFC PAUSE frame has been sent. Configured via the pool's `xoff` field.
-
-**Key pool fields:**
-
-- **`type`** — `ingress` or `egress`. Determines whether the pool serves incoming or outgoing traffic.
-- **`mode`** — `static` or `dynamic`. Controls how the shared region is divided among consumers (see profile thresholds below).
-- **`size`** — Total memory allocated to the pool, in bytes (includes all three regions).
-- **`xoff`** — (Ingress lossless pool only.) Size of the headroom region in bytes.
-
-#### What is a Buffer Profile?
-
-A buffer pool is a block of memory, but it says nothing about *who* can use it or *how much* each consumer can take. That is the job of a **buffer profile**.
-
-A buffer profile is a policy that says: "Consumers attached to me may draw from *this* pool, up to *this* threshold." You can think of a pool as a shared bank account and a profile as a spending policy card — each card is linked to one account and has its own spending limit.
-
-Each profile has these fields:
-
-- **`pool`** — Which pool this profile draws memory from.
-- **`size`** — A guaranteed (reserved) allocation in bytes. This memory is exclusively reserved for each consumer that uses this profile. Even when the pool is congested, each consumer is guaranteed at least this much. A `size` of `0` means no guaranteed reservation; the consumer relies entirely on the shared portion of the pool.
-
-The remaining fields depend on the pool's mode:
-
-**Static mode** (`egress_lossless_pool`):
-
-- **`static_th`** — A hard byte limit. Each consumer can use up to `size + static_th` bytes total. Once this threshold is reached, additional packets are dropped (or PFC is triggered). In the default config, `static_th` equals the entire pool size, meaning each lossless queue can potentially use the full pool (since lossless traffic is PFC-protected, not dropped).
-
-**Dynamic mode** (`ingress_lossless_pool`, `egress_lossy_pool`):
-
-- **`dynamic_th`** — An alpha exponent (integer, range −8 to 8) that controls how much of the pool's *currently available* shared space a consumer may use. The limit adjusts in real time as the pool fills and drains — a higher exponent allows more aggressive borrowing, while a lower exponent restricts the consumer to a smaller fraction. For the full alpha formula, value table, and behavioral details, see [Dynamic Thresholds](04a_BUFFER.md#tier-2-shared-pool).
-
-**Lossless ingress profiles** have additional fields that control PFC PAUSE behavior (see [PFC Thresholds](04_PFC.md#pfc-thresholds-managing-the-buffer) for conceptual background):
-
-- **`xoff`** — XOFF threshold in bytes. Sized for round-trip propagation delay (cable length, port speed) plus sender response time.
-- **`xon`** — XON threshold in bytes. The gap between `xoff` and `xon` provides hysteresis to prevent rapid pause/resume oscillation.
-- **`xon_offset`** — Alternative way to express the XON point as `headroom_size - xon_offset`. When both are set, the effective XON threshold is `max(xon, size - xon_offset)`.
-- **`size`** — Total headroom reserved for the PG. Must be at least `xoff` plus a safety margin.
-
-These values depend on port speed and cable length. SONiC provides a lookup table at `pg_profile_lookup.ini` in the hwsku directory with pre-calculated values:
-
-```bash
-cat $(python3 -c "from sonic_py_common import device_info; print(device_info.get_paths_to_platform_and_hwsku_dirs()[1])")/pg_profile_lookup.ini
-```
-
-Example entries (from this switch):
-
-```
-# speed cable size    xon  xoff    threshold xon_offset
- 100000  5m   1248    2288 165568  0         2288
- 100000  40m  1248    2288 177632  0         2288
- 100000  300m 1248    2288 268736  0         2288
-```
-
-A 100 Gbps port with a 5m cable needs 165568 bytes of XOFF headroom, while a 300m cable needs 268736 bytes — longer cables mean more in-flight data during the PAUSE round-trip.
+#### Default Buffer Profiles
 
 The default `config qos reload` defines three profiles (all lossy — no lossless ingress profile):
 
@@ -400,19 +488,9 @@ The default `config qos reload` defines three profiles (all lossy — no lossles
 
 > **No lossless ingress profile in the defaults:** The default template does not create a lossless ingress buffer profile with `xoff`/`xon` thresholds, and does not create `BUFFER_PG` entries for PG 3 or PG 4. This means PFC cannot function out of the box — you must create the profile and PG bindings manually (see Step 4).
 
-#### How Pools, Profiles, and Ports Fit Together
+#### Per-Port Buffer Bindings
 
-The relationship flows like this:
-
-```
-Pool  ←  Profile  ←  Port PG / Queue
-```
-
-1. A **pool** allocates a chunk of switch memory.
-2. A **profile** references one pool and defines the admission policy (thresholds).
-3. Each **port's Priority Group (PG)** or **queue** is bound to one profile, which determines where its packets are buffered and how much space it can use.
-
-The binding is stored in two CONFIG_DB tables: `BUFFER_PG` (ingress) and `BUFFER_QUEUE` (egress). To inspect them:
+Each port's PGs and queues are bound to profiles via two CONFIG_DB tables: `BUFFER_PG` (ingress) and `BUFFER_QUEUE` (egress). To inspect them:
 
 ```bash
 # All ingress PG → profile bindings
@@ -445,8 +523,6 @@ In the default AZURE configuration, **all 32 ports have identical assignments**.
 | 5-6    | `egress_lossy_profile` | `egress_lossy_pool` | 1518 B | `dynamic_th` = 3 |
 
 > **What is missing from the defaults:** Only PG 0 is configured on the ingress side. PG 3 and PG 4 (the lossless priority groups) have **no `BUFFER_PG` entry**, which means no ingress headroom is allocated for them. Queue 7 has **no `BUFFER_QUEUE` entry** on the egress side. This means `config qos reload` sets up the QoS classification maps (DSCP → TC 3/4 → PG 3/4) and enables PFC on priorities 3 and 4, but the buffer template does not actually allocate the lossless ingress headroom needed for PFC to function correctly. To enable working PFC, you must add `BUFFER_PG` entries for PG 3 and PG 4 with a lossless ingress profile (see Step 4).
-
-> **Why does the ingress lossy profile use the "lossless" pool?** SONiC's Memory-Table buffer model typically has a single ingress pool. The pool is named `ingress_lossless_pool` because it contains the lossless headroom (`xoff` reserve), but all ingress traffic — lossy and lossless — draws from it. The distinction between lossy and lossless at the ingress is handled by PG-level profile thresholds and PFC, not by separate pools.
 
 
 
